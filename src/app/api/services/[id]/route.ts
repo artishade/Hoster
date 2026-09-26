@@ -41,10 +41,11 @@ function normalizeInstances(raw: unknown): {
   current: number;
   scaleToZero: boolean;
   scaleToZeroDelaySec: number;
+  scaleOnDeploy: boolean;
 } {
   const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
   if (!raw || typeof raw !== 'object') {
-    return { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300 };
+    return { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300, scaleOnDeploy: false };
   }
   const r = raw as Record<string, unknown>;
   return {
@@ -53,6 +54,7 @@ function normalizeInstances(raw: unknown): {
     current: Math.max(0, Math.round(num(r.current, 1))),
     scaleToZero: Boolean(r.scaleToZero),
     scaleToZeroDelaySec: Math.max(0, Math.round(num(r.scaleToZeroDelaySec, 300))),
+    scaleOnDeploy: Boolean(r.scaleOnDeploy),
   };
 }
 

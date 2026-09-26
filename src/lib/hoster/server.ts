@@ -129,7 +129,7 @@ export function serializeService(
 ): Service {
   const status = (opts?.statusOverride ?? row.status) as Service['status'];
   const spec = tierSpec(row.hardwareTier);
-  const instances = safeParse(row.instancesJson, { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300 });
+  const instances = safeParse(row.instancesJson, { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300, scaleOnDeploy: false });
   const metrics =
     status === 'running'
       ? computeServiceMetrics(row, spec.ramGb)

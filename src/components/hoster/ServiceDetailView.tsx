@@ -48,6 +48,7 @@ import { Server,
 import ServiceTerminal from './ServiceTerminal';
 import ServiceHistoryChart from './ServiceHistoryChart';
 import QuickExecPanel from './QuickExecPanel';
+import { Switch } from '@/components/ui/switch';
 
 /** On-disk app.log metadata + tail lines (complete stdout+stderr record). */
 interface LogFileData {
@@ -402,6 +403,7 @@ export default function ServiceDetailView({
             current: service.instances.current,
             scaleToZero: service.instances.scaleToZero,
             scaleToZeroDelaySec: service.instances.scaleToZeroDelaySec,
+            scaleOnDeploy: service.instances.scaleOnDeploy,
           },
         }),
       });
@@ -412,6 +414,41 @@ export default function ServiceDetailView({
       toast.error(`Save failed: ${(err as Error).message}`);
     } finally {
       setIsSavingInstances(false);
+    }
+  };
+
+  // Webhook→autoscale coordination: scale to max as soon as a webhook
+  // redeploy reaches running (pre-traffic warm-up).
+  const [scaleOnDeployBusy, setScaleOnDeployBusy] = useState(false);
+  const handleScaleOnDeployToggle = async (enabled: boolean) => {
+    if (scaleOnDeployBusy) return;
+    setScaleOnDeployBusy(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          instances: {
+            min: instancesForm.min,
+            max: instancesForm.max,
+            current: service.instances.current,
+            scaleToZero: service.instances.scaleToZero,
+            scaleToZeroDelaySec: service.instances.scaleToZeroDelaySec,
+            scaleOnDeploy: enabled,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(`save failed (${res.status})`);
+      await queryClient.invalidateQueries({ queryKey: ['services'] });
+      toast.success(
+        enabled
+          ? `Scale-on-deploy armed — webhook redeploys warm to ${instancesForm.max} instance${instancesForm.max === 1 ? '' : 's'}`
+          : 'Scale-on-deploy disarmed'
+      );
+    } catch (err) {
+      toast.error(`Toggle failed: ${(err as Error).message}`);
+    } finally {
+      setScaleOnDeployBusy(false);
     }
   };
 
@@ -1041,6 +1078,15 @@ export default function ServiceDetailView({
               <p className="text-[11px] text-zinc-500">
                 Every push to <span className="text-cyan-300 font-mono">{service.repoUrl ? `${service.repoUrl.replace(/^https?:\/\//, '')} (branch ${service.branch})` : 'the tracked repo'}</span> re-runs the full git clone → build → run pipeline.
               </p>
+              {service.instances.scaleOnDeploy && service.instances.max > 1 && (
+                <span
+                  className="inline-flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md border border-emerald-800/60 bg-emerald-950/30 text-emerald-300"
+                  title="Webhook→autoscale coordination: as soon as this redeploy reaches running, the service scales to its configured max instances (pre-traffic warm-up)"
+                >
+                  <Zap className="w-3 h-3" />
+                  scale-on-deploy armed → warms to {service.instances.max} instances after each push
+                </span>
+              )}
             </div>
 
             {/* Secret */}
@@ -1469,7 +1515,7 @@ export default function ServiceDetailView({
               </div>
             </div>
 
-            {/* min/max editor */}
+            {/* min/max editor + webhook→autoscale coordination */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 items-end pt-3 border-t border-zinc-800">
               <div>
                 <label className="text-[10px] font-mono uppercase text-zinc-500 block mb-1">Min instances</label>
@@ -1487,9 +1533,28 @@ export default function ServiceDetailView({
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500"
                 />
               </div>
-              <p className="col-span-2 text-[10px] font-mono text-zinc-600 leading-relaxed">
-                autoscaling is armed for git deployments with max &gt; 1 — the policy sweep runs every 45s against real sampler CPU history
-              </p>
+              <div className="col-span-2 flex flex-col gap-1.5">
+                <label
+                  className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 cursor-pointer"
+                  title="Webhook→autoscale coordination: as soon as a webhook-triggered redeploy reaches running, scale straight to max instances — the announcement burst lands on a warm pool. The CPU policy engine may scale in later."
+                >
+                  <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-zinc-400">
+                    <Zap className={`w-3.5 h-3.5 ${service.instances.scaleOnDeploy && service.instances.max > 1 ? 'text-emerald-400' : 'text-zinc-600'}`} />
+                    scale to max on webhook deploy
+                  </span>
+                  <Switch
+                    checked={service.instances.scaleOnDeploy}
+                    disabled={scaleOnDeployBusy || !service.repoUrl}
+                    onCheckedChange={(v) => void handleScaleOnDeployToggle(v)}
+                    aria-label="Scale to max instances on webhook deploy"
+                  />
+                </label>
+                <p className="text-[10px] font-mono text-zinc-600 leading-relaxed">
+                  {service.instances.scaleOnDeploy && service.instances.max > 1
+                    ? <>armed: webhook redeploys warm up to <span className="text-emerald-300">{service.instances.max}</span> instances before traffic arrives</>
+                    : <>autoscaling is armed for git deployments with max &gt; 1 — the policy sweep runs every 45s against real sampler CPU history</>}
+                </p>
+              </div>
             </div>
           </div>
         </div>

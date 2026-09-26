@@ -279,6 +279,8 @@ export interface Service {
     current: number;
     scaleToZero: boolean;
     scaleToZeroDelaySec: number;
+    /** Webhook→autoscale coordination: scale to max as soon as a webhook-triggered redeploy is running (pre-traffic warm-up). */
+    scaleOnDeploy: boolean;
   };
   metrics: {
     cpuPercent: number;

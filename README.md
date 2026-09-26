@@ -53,13 +53,13 @@ The platform was deliberately rebuilt around one rule: *if it can't be measured,
 | **Web terminals** | Real per-service PTY shells | `node-pty` bash sessions in the service workspace via a socket.io micro-service, with guardrails: workspace validation, max 6 sessions (2/service), 30-min idle reaper, PTY killed on disconnect, sessions logged to the activity feed. |
 | **One-shot exec** | Run a command in a service workspace | `bash -lc` spawn with 2 000-char input cap, 5–60 s timeout, 128 KB output caps, one concurrent exec per service, and rolling-window rate limits (60/h per service, 240/h platform-wide). Full history ring (last 25 per service). |
 | **Autoscaling** | Process-level scale-out | Real worker processes spawned/killed on their own ports, round-robin ingress across primary + workers, aggregated `/proc` metrics, CPU-history-driven policy (65 % up / 12 % down hysteresis over a 5-min window, 3-min cooldown, hard cap 1+4 instances). |
-| **Webhooks** | Push-to-deploy | GitHub-compatible receiver with timing-safe HMAC-SHA256 signature verification (`x-hub-signature-256`), repo-URL normalization (protocol/`.git`/auth-insensitive), branch filters, in-progress guards, plus a generic token-authenticated endpoint for GitLab/Gitea/cron. Full delivery history. |
+| **Webhooks** | Push-to-deploy | GitHub-compatible receiver with timing-safe HMAC-SHA256 signature verification (`x-hub-signature-256`), repo-URL normalization (protocol/`.git`/auth-insensitive), branch filters, in-progress guards, plus a generic token-authenticated endpoint for GitLab/Gitea/cron. Full delivery history. Opt-in **webhook→autoscale coordination**: a per-service toggle scales the service to its configured max as soon as a webhook redeploy is running (pre-traffic warm-up). |
 | **Usage metering** | Instance-hours, requests, egress | 15 s sampler flushes real instance-seconds × live instance count (including scale-out workers), per-request counts, and content-length-measured egress into daily `UsageDaily` rows. Equivalent-cost view at public list-price ballpark — the platform itself bills $0.00. |
 | **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery results logged) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. |
 | **Cost projection** | 30-day outlook | Projects current footprint and configured autoscaler max over 720 h with live burn-rate, from real instance counts. |
 | **Activity feed** | Global real event stream | Deploys, watchdog transitions, DNS checks, DB ops, webhook deliveries, exec runs, terminal sessions, usage alerts — scope chips, level filters, live search, pause/resume, smart app-log budgets so failures always stream. |
 | **Databases & storage** | SQL + Redis consoles, volumes, buckets | Real SQL console queries, real Redis `SET`/`GET` round-trips with real keyspace/memory measurements, volumes as real on-disk directories with usage measured by walking the filesystem. |
-| **Command palette** | `Ctrl/⌘ + K` | Fuzzy search across services, all views, and quick actions (deploy, open shell, stop, restart) with per-service actions. |
+| **Command palette** | `Ctrl/⌘ + K` | Fuzzy search across services, all views, and quick actions (deploy, open shell, stop, restart) with per-service actions — plus a **live terminal pool**: every open PTY session on the host with one-keystroke operator kill. |
 | **MCP inspector & agent API** | `/api/mcp/execute`, `/api/agent/*` | Programmatic control of the platform, plus an AI architecture advisor modal in the UI. |
 
 ![Services](docs/screenshots/services.png)
@@ -210,6 +210,8 @@ Each service gets a unique secret (`wh_...`). Configure GitHub:
 3. Payload URL = the endpoint, Secret = the service secret, Event = push
 
 On every push, Hoster verifies the `x-hub-signature-256` HMAC (timing-safe), matches the repo URL (protocol/`.git`/credentials-insensitive), filters by branch, kills the old process tree, and re-runs the full real pipeline. Delivery history (accepted / skipped / rejected, with reasons) is available per-service and in the global activity feed.
+
+**Webhook→autoscale coordination** (opt-in per service, Hardware tab): when armed, a bounded watcher scales the service to its configured instance max as soon as the webhook-triggered redeploy reaches `running` — the announcement burst lands on a warm pool, and the CPU policy engine may scale back in later. Config survives restarts (persisted with the service's instance settings).
 
 Non-GitHub CI (GitLab, Gitea, cron, `curl`):
 

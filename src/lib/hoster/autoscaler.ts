@@ -169,10 +169,10 @@ function parseRuntime(json: string | null): ServiceRuntime | null {
   }
 }
 
-function parseInstances(json: string): { min: number; max: number; current: number; scaleToZero: boolean; scaleToZeroDelaySec: number } {
+function parseInstances(json: string): { min: number; max: number; current: number; scaleToZero: boolean; scaleToZeroDelaySec: number; scaleOnDeploy: boolean } {
   try {
     return JSON.parse(json);
   } catch {
-    return { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300 };
+    return { min: 1, max: 1, current: 1, scaleToZero: false, scaleToZeroDelaySec: 300, scaleOnDeploy: false };
   }
 }

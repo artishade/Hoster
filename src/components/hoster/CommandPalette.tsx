@@ -5,13 +5,16 @@
  *
  * Everything it offers is REAL: navigation to every view, jump to any service /
  * database / volume / domain by name (fetched live), per-service quick actions
- * (open terminal, stop/restart), and platform actions (deploy, advisor).
- * cmdk powers the fuzzy search; actions execute the same callbacks the rest
- * of the UI uses.
+ * (open terminal, stop/restart), platform actions (deploy, advisor), and a
+ * LIVE view of the terminal pool — every open PTY session on the host, with
+ * one-keystroke operator kill (same session-manager protocol the Settings
+ * view uses). cmdk powers the fuzzy search; actions execute the same callbacks
+ * the rest of the UI uses.
  */
 
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Command } from 'cmdk';
+import { toast } from 'sonner';
 import {
   Search,
   Rocket,
@@ -30,6 +33,7 @@ import {
   CornerDownLeft,
   ArrowRight,
   Receipt,
+  TerminalSquare,
 } from 'lucide-react';
 import type { Service } from '@/lib/hoster/types';
 
@@ -37,6 +41,14 @@ export interface PaletteServiceAction {
   id: string;
   label: string;
   run: () => void;
+}
+
+interface LiveSessionRow {
+  socketId: string;
+  service: string;
+  pid: number;
+  idleSec: number;
+  ageSec: number;
 }
 
 interface Props {
@@ -80,6 +92,66 @@ export default function CommandPalette({
   domainCount,
 }: Props) {
   const [value, setValue] = useState('');
+
+  // ── LIVE terminal pool (session-manager protocol, no PTY attached) ──────
+  const [liveSessions, setLiveSessions] = useState<LiveSessionRow[]>([]);
+  const socketRef = useRef<{ disconnect: () => void } | null>(null);
+
+  const killSession = useCallback((socketId: string, service: string, pid: number) => {
+    // ack params typed as `never` — accepts any callback shape (socket.io acks)
+    const socket = socketRef.current as unknown as
+      { emit: (ev: string, p: unknown, ack?: (r: never) => void) => void } | null;
+    if (!socket) return;
+    socket.emit('kill-session', { socketId }, (r: { ok?: boolean; error?: string }) => {
+      if (r?.ok) {
+        toast.success(`Killed terminal session for ${service} (pty pid ${pid})`);
+        socket.emit('list-sessions', {}, (rr: { ok?: boolean; sessions?: LiveSessionRow[] }) => {
+          if (rr?.ok) setLiveSessions(rr.sessions ?? []);
+        });
+      } else {
+        toast.error(`Kill failed: ${r?.error ?? 'unknown error'}`);
+      }
+    });
+  }, []);
+
+  // While the palette is open, keep a read-only socket to the terminal
+  // service and refresh the live session list every 4s. Torn down on close.
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    (async () => {
+      try {
+        const { io } = await import('socket.io-client');
+        if (!alive) return;
+        const socket = io('/?XTransformPort=3031', {
+          transports: ['websocket', 'polling'],
+          reconnection: false,
+          timeout: 5000,
+        });
+        if (!alive) {
+          socket.disconnect();
+          return;
+        }
+        socketRef.current = socket;
+        const refresh = () =>
+          socket.emit('list-sessions', {}, (r: { ok?: boolean; sessions?: LiveSessionRow[] }) => {
+            if (r?.ok) setLiveSessions(r.sessions ?? []);
+          });
+        socket.on('connect', refresh);
+        timer = setInterval(refresh, 4000);
+      } catch {
+        /* palette stays usable without the terminal pool */
+      }
+    })();
+    return () => {
+      alive = false;
+      if (timer) clearInterval(timer);
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      setLiveSessions([]);
+    };
+  }, [open]);
 
   // Reset the query each time the palette opens.
   useEffect(() => {
@@ -256,6 +328,37 @@ export default function CommandPalette({
                   }
                   return items;
                 })}
+            </Command.Group>
+          )}
+
+          {/* Live terminal sessions — real PTYs on the host, one-keystroke kill */}
+          {liveSessions.length > 0 && (
+            <Command.Group
+              heading={
+                <span className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-zinc-500">
+                  <TerminalSquare className="w-3 h-3" /> Terminal sessions ({liveSessions.length} live)
+                </span>
+              }
+            >
+              {liveSessions.map((s) => (
+                <Item
+                  key={s.socketId}
+                  icon={
+                    <span className="relative flex w-2 h-2 shrink-0">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+                    </span>
+                  }
+                  label={`kill terminal: ${s.service}`}
+                  hint={`pid ${s.pid} · idle ${s.idleSec < 60 ? `${s.idleSec}s` : `${Math.floor(s.idleSec / 60)}m`} · age ${s.ageSec < 60 ? `${s.ageSec}s` : `${Math.floor(s.ageSec / 60)}m`}`}
+                  onSelect={() => killSession(s.socketId, s.service, s.pid)}
+                  trailing={
+                    <span className="flex items-center gap-1 text-[9px] font-mono text-red-400/80 uppercase">
+                      <StopCircle className="w-3 h-3" /> kill
+                    </span>
+                  }
+                />
+              ))}
             </Command.Group>
           )}
 

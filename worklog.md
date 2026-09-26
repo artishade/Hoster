@@ -329,3 +329,29 @@ Stage Summary:
 - New capability: usage alerting graduated from env-tuned to a first-class operator feature — DB-persisted threshold ladders/budgets + webhook fan-out with delivery receipts, editable from the dashboard, E2E-verified end-to-end including the dedupe interplay, level filtering, and failure path.
 - Known risks: after any prisma db:push the dev server MUST be fully restarted (stale client — recurred this round); test alert rows from this round remain in today's activity feed (real events, honest); the fan-out fetch has no retry (by design — receipts make failures visible).
 - Recommended next phase: webhook→autoscale coordination (pre-traffic scale-up hooks), terminal sessions in the command palette, TLS via Caddy on a real host, delivery-log retention policy, per-service (not just platform-wide) webhook targets.
+
+---
+Task ID: review-round-10 (cron webDevReview)
+Agent: main agent (Z.ai Code)
+Task: Assess status, QA via agent-browser, implement webhook→autoscale coordination + live terminal sessions in the command palette (round-9's top two recommendations), styling polish
+
+Work Log:
+- HEALTH CHECK: dev server 200, terminal service alive, 5/6 services running (nova failed = real), all ingress 200, no recent dev.log errors. QA sweep via agent-browser across all 8 views + mobile 375px: zero console errors, no overflow.
+- NEW FEATURE — Webhook→autoscale coordination ("scale to max on webhook deploy", round-9 #1 recommendation):
+  * Service.instances gains scaleOnDeploy (persisted in instancesJson — NO schema change, so no db:push/restart needed): types.ts, PATCH normalizeInstances, serializeService default, autoscaler parseInstances default all round-trip it.
+  * webhooks.ts triggerRedeploy now launches a bounded post-deploy watcher (5s poll, 15-min cap): when the redeploy reaches 'running' and the opt-in is still set (re-read from DB — operator can disarm mid-deploy), it calls the REAL scaleServiceTo(inst.max) and logs "Webhook→autoscale: ... scaled to N/M instances right after redeploy". Failed/stopped/deleted services exit the watcher cleanly.
+  * UI: Hardware tab Autoscaling card gained a Switch toggle "scale to max on webhook deploy" (immediate PATCH + toast; bounds-save round-trips the flag); Webhooks tab shows an emerald "scale-on-deploy armed → warms to N instances after each push" chip when active.
+  * E2E VERIFIED: armed real-node-app (max 4) → triggered the REAL generic webhook (secret auth) → full pipeline re-ran (fresh pid, same commit) → watcher scaled to 4/4 (3 real workers, all ALIVE, round-robin ingress 6/6 × 200) with the log entry present. Afterward the CPU policy scaled one worker in (3/4) — the two systems cooperating as designed. Cleaned up: scaled to 1, flag disarmed.
+- NEW FEATURE — Live terminal sessions in the command palette (round-9 #2 recommendation):
+  * CommandPalette now keeps a read-only socket.io connection to the terminal service while open (dynamic import, 4s list-sessions refresh, teardown on close — no PTY attached, same session-manager protocol as the Settings panel) and renders a "Terminal sessions (N live)" group: pulsing dot, service name, real pid/idle/age, one-keystroke KILL (socket kill-session + toast + immediate refresh).
+  * E2E VERIFIED through the gateway (palette sockets only work via :81 — the known XTransformPort contract): daemonized (double-fork) node script attached a REAL PTY (pid 9756) → palette showed "Terminal sessions (1 live)" + "kill terminal: real-node-app" + pid → clicked kill → the script's exit handler fired ([exit] {"code":0}) proving the real PTY died → group refreshed to empty. VLM review of the palette + hardware toggle screenshots: PASS both.
+  * TEST INFRASTRUCTURE LESSON (cost ~20 min of debugging): background processes started from tool calls get REAPED when the call ends (round-3 knowledge — applies to test helpers too, not just services). The palette looked "broken" while the real cause was my test PTY sessions dying to sandbox reaping + a spurious node --watch restart of the terminal service (detected a change in node_modules/ms). Fix: daemonize test helpers with the double-fork pattern (launch.py-style, PPID 1).
+- Styling: session rows with animated ping dot + red kill trailing chip; toggle card follows the mono-label/zinc/cyan design language; armed/disarmed hint copy swaps contextually.
+- Verified: tsc clean (src), eslint clean, zero console errors across all views + mobile, real-node-app restored to 1 instance / flag off.
+- README updated: feature table (webhooks + palette rows), push-to-deploy section documents the coordination toggle.
+
+Stage Summary:
+- Both round-9 top recommendations shipped and E2E-verified: webhook redeploys can now pre-warm to max instances (real processes, real logs), and the command palette is a live ops surface for the terminal pool (list + kill real PTYs without leaving the keyboard).
+- The autoscaler and the new watcher coexist correctly (watcher scales out post-deploy; CPU policy scales in when idle) — verified live.
+- Known risks: palette terminal pool requires gateway access (by design); spurious node --watch restarts of the terminal service (node_modules churn) kill live PTY sessions — cosmetic for ops, but worth excluding node_modules from the watch scope someday.
+- Recommended next phase: delivery/log retention policy (WebhookDelivery + LogEntry growth), per-service alert webhook targets, TLS via Caddy on a real host, uv-everywhere cold-deploy caching, exclude node_modules from terminal-service --watch.
