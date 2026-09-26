@@ -170,10 +170,10 @@ export default function CustomDomainsView({
                 </span>
               </div>
 
-              <div className="flex items-center gap-3 text-xs font-mono text-zinc-400">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-mono text-zinc-400">
                 <span className="flex items-center gap-1 text-zinc-300">
                   <Server className="w-3.5 h-3.5 text-cyan-400" />
-                  Routes to: <strong className="text-cyan-300">{dom.serviceName}</strong>
+                  Routes to: <strong className="text-cyan-300 whitespace-nowrap">{dom.serviceName}</strong>
                 </span>
                 <span>&bull;</span>
                 <span className="text-zinc-500">Added: {dom.createdAt}</span>

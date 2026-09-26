@@ -107,10 +107,28 @@ export async function GET() {
     void reconcileRuntimes().catch(() => {});
     const rows = await db.service.findMany({ orderBy: { createdAt: 'desc' } });
     const host = await getHostMetrics();
+    // Last REAL successful pipeline run per service (one aggregate query) —
+    // powers the honest "Deployed X ago" + run count on service cards.
+    const depAgg = await db.deployment.groupBy({
+      by: ['serviceId'],
+      where: { status: 'success' },
+      _max: { startedAt: true },
+      _count: { _all: true },
+    });
+    const lastDeploys = new Map<string, { at: Date; count: number }>(
+      depAgg
+        .filter((d) => d._max.startedAt)
+        .map((d) => [d.serviceId, { at: d._max.startedAt as Date, count: d._count._all }])
+    );
     const data: Service[] = [];
     for (const row of rows) {
       const life = await advanceServiceLifecycle(row);
-      data.push(serializeService(row, host, { statusOverride: life.status }));
+      data.push(
+        serializeService(row, host, {
+          statusOverride: life.status,
+          lastSuccessDeploy: lastDeploys.get(row.id) ?? null,
+        })
+      );
     }
     // Lazy webhook-secret migration: any legacy service still missing a
     // deploy-webhook secret gets one (single write per service, then never).
@@ -238,7 +256,7 @@ export async function POST(req: NextRequest) {
         port,
         envVarsJson: JSON.stringify(envVars),
         volumeMountsJson: JSON.stringify(volumeMounts),
-      }).catch(async (err) => {
+      }, { trigger: 'deploy' }).catch(async (err) => {
         console.error('[api/services] deploy pipeline crashed', err);
         await db.service.update({ where: { id: created.id }, data: { status: 'failed' } }).catch(() => {});
       });

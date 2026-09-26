@@ -73,7 +73,19 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
 
     const life = await advanceServiceLifecycle(row);
     const host = await getHostMetrics();
-    return NextResponse.json({ data: serializeService(row, host, { statusOverride: life.status }) });
+    // Last REAL successful pipeline run — honest "Deployed X ago" in the detail header.
+    const lastDep = await db.deployment.findFirst({
+      where: { serviceId: id, status: 'success' },
+      orderBy: { startedAt: 'desc' },
+      select: { startedAt: true },
+    });
+    const depCount = await db.deployment.count({ where: { serviceId: id, status: 'success' } });
+    return NextResponse.json({
+      data: serializeService(row, host, {
+        statusOverride: life.status,
+        lastSuccessDeploy: lastDep ? { at: lastDep.startedAt, count: depCount } : null,
+      }),
+    });
   } catch (err) {
     console.error('[api/services/[id]] GET failed', err);
     return NextResponse.json({ error: 'Failed to load service' }, { status: 500 });
@@ -268,7 +280,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
           port: fresh.port,
           envVarsJson: fresh.envVarsJson,
           volumeMountsJson: fresh.volumeMountsJson,
-        }).catch(async (err) => {
+        }, { trigger: 'redeploy' }).catch(async (err) => {
           console.error('[api/services/[id]] redeploy crashed', err);
           await db.service.update({ where: { id }, data: { status: 'failed' } }).catch(() => {});
         });

@@ -46,6 +46,7 @@ model Service {
   logs              LogEntry[]
   data              ServiceData[]
   webhookDeliveries WebhookDelivery[]
+  deployments       Deployment[]
 }
 
 // Persistent key/value store for deployed services — the builtin runner's
@@ -178,6 +179,29 @@ model Provider {
   lastHeartbeatAt  DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
+}
+
+// ─── Deployment history (REAL pipeline runs: clone → install → build → spawn) ─
+// One row per startDeployment() execution, including failures, webhook
+// redeploys, self-heals and operator rollbacks (git checkout of a past commit).
+// The service detail "Deployments" section renders this table and offers
+// one-click rollback to any past successful commit.
+
+model Deployment {
+  id            String    @id @default(cuid())
+  serviceId     String
+  trigger       String    @default("deploy") // deploy | redeploy | webhook | self-heal | rollback | boot
+  status        String    @default("pending") // pending | success | failed
+  commit        String    @default("") // real short SHA once known
+  commitMessage String    @default("")
+  failureReason String    @default("") // tail of the real stderr when status = failed
+  startedAt    DateTime  @default(now())
+  finishedAt    DateTime?
+  durationMs    Int       @default(0)
+
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, startedAt])
 }
 
 // ─── Deploy webhooks (GitHub push events, generic CI triggers) ────────────────

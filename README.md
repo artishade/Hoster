@@ -43,19 +43,20 @@ The platform was deliberately rebuilt around one rule: *if it can't be measured,
 
 | Area | What it does | How it stays real |
 |---|---|---|
-| **Deployer** | Deploy from any Git URL | `git clone` → stack auto-detect (Node / Python / static) → install (`bun` → `npm` fallback; `uv` → `pip` fallback into a per-service venv) → optional build → real detached child process → HTTP readiness probe. Real commit hash extracted from the clone. |
+| **Deployer** | Deploy from any Git URL | `git clone` → stack auto-detect (Node / Python / static) → install (`bun` → `npm` fallback; `uv` → `pip` fallback into a per-service venv) → optional build → real detached child process → HTTP readiness probe. Real commit hash extracted from the clone. Service cards show the timestamp of the **last successful pipeline run** (from the Deployment table) with the run count, not the service creation date. |
 | **Stack detection** | Node, Python, static sites | `package.json` → Node (reads `start`/build scripts); `requirements.txt` → Python (prefers `app.py`/`main.py`, then Heroku-style `Procfile web:`, then `manage.py` with automatic Django `collectstatic` build step); otherwise served as static. |
 | **Edge routing** | `Host: <name>.nexushost.dev` → your app | Next.js `proxy.ts` host-header routing to `/api/ingress/<name>/*`; custom domains resolved DB-backed via `/api/edge/resolve`. Works on any host with wildcard DNS — no code change. |
 | **Readiness semantics** | Heroku-style | Any HTTP answer counts as up — app-level 5xx are the app's own and visible in its logs. |
 | **Telemetry** | CPU / RAM / requests / p95 | Real request counters and P95 from a live ring (recorded per proxied request); CPU/RAM parsed from `/proc/<pid>` (resolves `bash` → `bun` → `node` to the actual worker). |
 | **Providers** | 5 built-ins: local node, Hugging Face Spaces, Render, Fly.io, Koyeb | Connected tokenless via public endpoint probes (any HTTP answer = live; 401/404 counts). Auto re-verify watchdog sweeps every 30 s; tokens never leave the server (`hasToken` + last-4 only). |
+| **Deployment history** | One row per real pipeline run | Every `clone → install → build → spawn → probe` execution is recorded with wall-clock duration, trigger (deploy / redeploy / webhook / self-heal / rollback / boot), the real commit SHA + message, and failure reasons quoting the real stderr tail. The service detail "Deployments" tab renders the table with stat tiles (success/failure/rollback counts, avg duration) and **one-click rollback**: the pipeline re-runs pinned to a past commit (`git fetch --depth 60` + `git checkout --detach`), so a bad release is one confirm-dialog away from being undone — and rolling forward again is just another rollback. |
 | **Restart resilience** | Deploys survive control-plane restarts | Apps spawn detached (own process group), logs go to `deployments/<name>/app.log` on raw fds (restart-proof), an orphan-adoption watchdog re-binds surviving processes to their service records with metrics intact, and bounded self-healing (max 3 relaunches / 2 h per service) recovers genuinely dead processes. |
 | **Web terminals** | Real per-service PTY shells | `node-pty` bash sessions in the service workspace via a socket.io micro-service, with guardrails: workspace validation, max 6 sessions (2/service), 30-min idle reaper, PTY killed on disconnect, sessions logged to the activity feed. |
 | **One-shot exec** | Run a command in a service workspace | `bash -lc` spawn with 2 000-char input cap, 5–60 s timeout, 128 KB output caps, one concurrent exec per service, and rolling-window rate limits (60/h per service, 240/h platform-wide). Full history ring (last 25 per service). |
 | **Autoscaling** | Process-level scale-out | Real worker processes spawned/killed on their own ports, round-robin ingress across primary + workers, aggregated `/proc` metrics, CPU-history-driven policy (65 % up / 12 % down hysteresis over a 5-min window, 3-min cooldown, hard cap 1+4 instances). |
 | **Webhooks** | Push-to-deploy | GitHub-compatible receiver with timing-safe HMAC-SHA256 signature verification (`x-hub-signature-256`), repo-URL normalization (protocol/`.git`/auth-insensitive), branch filters, in-progress guards, plus a generic token-authenticated endpoint for GitLab/Gitea/cron. Full delivery history. Opt-in **webhook→autoscale coordination**: a per-service toggle scales the service to its configured max as soon as a webhook redeploy is running (pre-traffic warm-up). |
 | **Usage metering** | Instance-hours, requests, egress | 15 s sampler flushes real instance-seconds × live instance count (including scale-out workers), per-request counts, and content-length-measured egress into daily `UsageDaily` rows. Equivalent-cost view at public list-price ballpark — the platform itself bills $0.00. |
-| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery results logged) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. Each service can additionally carry its **own alert webhook target** so a service owner receives only their own alerts. |
+| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery receipts logged, and transient failures retried on a 30 s → 2 min → 10 min backoff ladder with a receipt per attempt) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. Each service can additionally carry its **own alert webhook target** so a service owner receives only their own alerts. |
 | **Cost projection** | 30-day outlook | Projects current footprint and configured autoscaler max over 720 h with live burn-rate, from real instance counts. |
 | **Activity feed** | Global real event stream | Deploys, watchdog transitions, DNS checks, DB ops, webhook deliveries, exec runs, terminal sessions, usage alerts — scope chips, level filters, live search, pause/resume, smart app-log budgets so failures always stream. Includes an editable **data-retention policy** with live DB-growth stats and real pruning. |
 | **Data retention** | Bounded DB growth | Operator-editable retention policy (log rows / webhook-delivery days, auto-prune interval, on/off toggle) persisted in the DB with env fallbacks. The 15 s sampler runs real `DELETE` passes; every prune that deletes rows writes a receipt into the very feed it governs. The Activity view shows live stats: row counts, oldest-row age, real growth/day, DB file size, next auto-prune countdown. |
@@ -196,6 +197,10 @@ Stop/start/restart are real lifecycle operations: stop kills the exact process t
 
 ![Service detail](docs/screenshots/service-detail.png)
 
+The **Deployments** tab of a service records every real pipeline run (trigger, commit, duration, real stderr tails on failures) and offers one-click rollback to any past successful commit:
+
+![Deployments & rollback](docs/screenshots/deployments.png)
+
 ### Custom domains and edge routing
 
 - Host-header routing works out of the box: any request with `Host: <service>.nexushost.dev` is routed to that service (including scale-out round-robin).
@@ -271,6 +276,8 @@ Free-tier hardware specs are **measured from the actual host** at runtime (vCPU 
 | `GET`/`POST` | `/api/services` | List / deploy services |
 | `GET`/`PATCH`/`DELETE` | `/api/services/<id>` | Inspect; actions: `start`, `stop`, `restart`, `scale`, `rotate-webhook`; delete |
 | `GET` | `/api/services/<id>/history` | Real metric samples (CPU/RAM/rpm/p95) for charts |
+| `GET` | `/api/services/<id>/deployments` | Real pipeline-run history: trigger, status, commit, duration, failure tails, per-run stats |
+| `POST` | `/api/services/<id>/rollback` | One-click rollback — `{ deploymentId }` or `{ commit }`; re-runs the pipeline pinned to the commit |
 | `GET` | `/api/services/<id>/log-file` | On-disk `app.log` reader — `?tail=N`, `?download=1` |
 | `POST`/`GET` | `/api/services/<id>/exec` | Run one-shot command / exec history |
 | `ANY` | `/api/ingress/<name>/*` | Edge ingress to a deployed service |
@@ -299,7 +306,7 @@ The terminal service (port 3031) speaks socket.io at path `/` with events for at
 
 ## Data model
 
-Prisma models (SQLite): `Service` (runtime state incl. workers + start command, webhook secret), `ServiceData`, `PostgresDb`, `RedisDb`, `Volume`, `Bucket`, `Domain`, `Provider` (tokens server-side only), `WebhookDelivery`, `UsageDaily`, `MetricSample`, `LogEntry`.
+Prisma models (SQLite): `Service` (runtime state incl. workers + start command, webhook secret), `ServiceData`, `PostgresDb`, `RedisDb`, `Volume`, `Bucket`, `Domain`, `Provider` (tokens server-side only), `Deployment` (pipeline-run history: trigger/status/commit/duration/failure tails — the rollback source of truth), `WebhookDelivery`, `UsageDaily`, `MetricSample`, `LogEntry`.
 
 ## Design principles
 

@@ -4,12 +4,14 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
-  Service, 
-  LogEntry, 
-  PostgresDatabase, 
-  RedisDatabase, 
-  PersistentVolume, 
-  S3BucketConfig 
+  Service,
+  LogEntry,
+  PostgresDatabase,
+  RedisDatabase,
+  PersistentVolume,
+  S3BucketConfig,
+  DeploymentHistory,
+  DeploymentRecord,
 } from '@/lib/hoster/types';
 import { HARDWARE_SPECS } from '@/lib/hoster/hardware-specs';
 import { Server, 
@@ -44,7 +46,12 @@ import { Server,
   RotateCw,
   FileText,
   History,
-  SquareArrowRight
+  SquareArrowRight,
+  GitCommitHorizontal,
+  Undo2,
+  CircleCheck,
+  CircleX,
+  Loader2
 } from 'lucide-react';
 import ServiceTerminal from './ServiceTerminal';
 import ServiceHistoryChart from './ServiceHistoryChart';
@@ -108,7 +115,7 @@ export default function ServiceDetailView({
   onRestartService,
   onDeleteService,
 }: ServiceDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'terminal' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'terminal' | 'webhooks' | 'deployments' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
   const queryClient = useQueryClient();
   
   // Hardware Spec
@@ -142,6 +149,52 @@ export default function ServiceDetailView({
   const [alertWebhookInput, setAlertWebhookInput] = useState(service.alertWebhookUrl ?? '');
   const [alertWebhookSaving, setAlertWebhookSaving] = useState(false);
   useEffect(() => setAlertWebhookInput(service.alertWebhookUrl ?? ''), [service.alertWebhookUrl]);
+
+  // Deployment history — REAL pipeline runs (poll while the tab is open).
+  const [depHistory, setDepHistory] = useState<DeploymentHistory | null>(null);
+  const [rollbackBusyId, setRollbackBusyId] = useState<string | null>(null);
+  const [rollbackConfirmId, setRollbackConfirmId] = useState<string | null>(null);
+  useEffect(() => {
+    if (activeTab !== 'deployments') return;
+    let cancelled = false;
+    const fetchHistory = async () => {
+      try {
+        const res = await fetch(`/api/services/${service.id}/deployments?limit=20`);
+        const json = await res.json();
+        if (!cancelled && json?.data) setDepHistory(json.data as DeploymentHistory);
+      } catch {
+        /* transient */
+      }
+    };
+    void fetchHistory();
+    const interval = setInterval(fetchHistory, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeTab, service.id]);
+
+  const handleRollback = async (dep: DeploymentRecord) => {
+    setRollbackBusyId(dep.id);
+    try {
+      const res = await fetch(`/api/services/${service.id}/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deploymentId: dep.id }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        toast.error(json?.error || 'Rollback failed');
+      } else {
+        toast.success(json?.data?.message || `Rollback to ${dep.commit} started`);
+        setRollbackConfirmId(null);
+      }
+    } catch (err) {
+      toast.error((err as Error).message || 'Rollback request failed');
+    } finally {
+      setRollbackBusyId(null);
+    }
+  };
 
   const handleSaveAlertWebhook = async () => {
     const url = alertWebhookInput.trim();
@@ -682,6 +735,7 @@ export default function ServiceDetailView({
           { id: 'logs', label: 'Live Logs Terminal', icon: Terminal },
           { id: 'terminal', label: 'Workspace Shell (PTY)', icon: SquareArrowRight },
           { id: 'webhooks', label: 'Deploy Webhooks', icon: Webhook },
+          { id: 'deployments', label: 'Deployments & Rollback', icon: History },
           ...(isMcp || isPlugin ? [{ id: 'mcp', label: 'MCP & Plugin Studio', icon: Code }] : []),
           { id: 'hardware', label: 'Hardware & GPU Scaling', icon: Cpu },
           { id: 'env', label: 'Environment & Secrets', icon: Key },
@@ -693,7 +747,7 @@ export default function ServiceDetailView({
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'terminal' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
+              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'terminal' | 'webhooks' | 'deployments' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
               className={`flex items-center gap-2 px-4 py-2.5 border-b-2 whitespace-nowrap transition ${
                 isActive
                   ? 'border-cyan-400 text-cyan-300 bg-cyan-950/20'
@@ -1307,6 +1361,181 @@ export default function ServiceDetailView({
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* TAB: DEPLOYMENTS & ROLLBACK — real pipeline history */}
+      {activeTab === 'deployments' && (
+        <div className="space-y-6">
+          {/* Stat tiles */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <span className="text-[11px] text-zinc-400 font-mono uppercase">Total runs</span>
+              <div className="text-2xl font-bold font-mono text-zinc-100 mt-1">{depHistory?.stats.total ?? '—'}</div>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">pipeline executions recorded</p>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <span className="text-[11px] text-zinc-400 font-mono uppercase">Succeeded</span>
+              <div className="text-2xl font-bold font-mono text-emerald-400 mt-1">{depHistory?.stats.success ?? '—'}</div>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">reached HTTP-ready state</p>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <span className="text-[11px] text-zinc-400 font-mono uppercase">Failed</span>
+              <div className="text-2xl font-bold font-mono text-red-400 mt-1">{depHistory?.stats.failed ?? '—'}</div>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">with the real stderr tail</p>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <span className="text-[11px] text-zinc-400 font-mono uppercase">Rollbacks</span>
+              <div className="text-2xl font-bold font-mono text-amber-400 mt-1">{depHistory?.stats.rollbacks ?? '—'}</div>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">git checkouts of past commits</p>
+            </div>
+            <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <span className="text-[11px] text-zinc-400 font-mono uppercase">Avg duration</span>
+              <div className="text-2xl font-bold font-mono text-cyan-300 mt-1">
+                {depHistory ? (depHistory.stats.avgDurationMs ? `${(depHistory.stats.avgDurationMs / 1000).toFixed(1)}s` : '—') : '—'}
+              </div>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">clone → install → build → ready</p>
+            </div>
+          </div>
+
+          {/* History list */}
+          <div className="p-5 rounded-2xl bg-zinc-900/60 border border-zinc-800">
+            <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
+              <div>
+                <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                  <GitCommitHorizontal className="w-4 h-4 text-cyan-400" />
+                  Deployment history
+                </h3>
+                <p className="text-[11px] text-zinc-500 font-mono mt-0.5">
+                  every run of the real pipeline — clone → install → build → spawn → HTTP probe. Roll back to any past successful commit.
+                </p>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/50">
+                live @ commit {service.commitHash || '—'}
+              </span>
+            </div>
+
+            {!depHistory ? (
+              <div className="py-10 text-center text-zinc-500 font-mono text-xs">Loading deployment history…</div>
+            ) : depHistory.deployments.length === 0 ? (
+              <div className="py-10 text-center text-zinc-500 font-mono text-xs">
+                No pipeline runs recorded yet — deploy or restart this service to create history.
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                {depHistory.deployments.map((dep) => (
+                  <div
+                    key={dep.id}
+                    className={`p-3 rounded-xl border transition-colors ${
+                      dep.isCurrent
+                        ? 'bg-emerald-950/20 border-emerald-800/40'
+                        : 'bg-zinc-900/80 border-zinc-800 hover:border-zinc-700'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 flex-wrap">
+                      {/* status icon */}
+                      {dep.status === 'success' ? (
+                        <CircleCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : dep.status === 'failed' ? (
+                        <CircleX className="w-4 h-4 text-red-400 shrink-0" />
+                      ) : (
+                        <Loader2 className="w-4 h-4 text-cyan-400 shrink-0 animate-spin" />
+                      )}
+
+                      {/* commit + message */}
+                      <span className={`font-mono text-xs font-semibold ${dep.isCurrent ? 'text-emerald-300' : 'text-cyan-300'}`}>
+                        {dep.commit || '(no commit — failed before clone finished)'}
+                      </span>
+                      <span className="text-xs text-zinc-400 truncate max-w-[280px] sm:max-w-[420px]">{dep.commitMessage}</span>
+
+                      {/* trigger badge */}
+                      <span
+                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                          dep.trigger === 'rollback'
+                            ? 'bg-amber-950/50 text-amber-300 border-amber-800/50'
+                            : dep.trigger === 'webhook'
+                            ? 'bg-purple-950/50 text-purple-300 border-purple-800/50'
+                            : dep.trigger === 'self-heal' || dep.trigger === 'boot'
+                            ? 'bg-zinc-800 text-zinc-300 border-zinc-700'
+                            : 'bg-zinc-800/60 text-zinc-400 border-zinc-700/60'
+                        }`}
+                      >
+                        {dep.trigger}
+                      </span>
+
+                      {dep.isCurrent && (
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/50 text-emerald-300 border border-emerald-800/50">
+                          LIVE
+                        </span>
+                      )}
+
+                      <span className="text-[10px] text-zinc-500 font-mono ml-auto">
+                        {new Date(dep.startedAt).toLocaleString()} ·{' '}
+                        {dep.status === 'pending' ? 'running…' : `${(dep.durationMs / 1000).toFixed(1)}s`}
+                      </span>
+
+                      {/* rollback action */}
+                      {dep.status === 'success' && !dep.isCurrent && service.repoUrl && (
+                        <div className="w-full sm:w-auto">
+                          {rollbackConfirmId === dep.id ? (
+                            <div className="flex items-center gap-2 justify-end">
+                              <span className="text-[11px] text-amber-300 font-mono">
+                                kill current process &amp; re-run pipeline at {dep.commit}?
+                              </span>
+                              <button
+                                onClick={() => void handleRollback(dep)}
+                                disabled={rollbackBusyId === dep.id}
+                                className="text-[11px] font-mono px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 text-zinc-950 font-semibold disabled:opacity-50 transition"
+                              >
+                                {rollbackBusyId === dep.id ? 'starting…' : 'confirm rollback'}
+                              </button>
+                              <button
+                                onClick={() => setRollbackConfirmId(null)}
+                                className="text-[11px] font-mono px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition"
+                              >
+                                cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => {
+                                setRollbackConfirmId(dep.id);
+                              }}
+                              disabled={service.status === 'building' || service.status === 'deploying'}
+                              className="flex items-center gap-1.5 text-[11px] font-mono px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-zinc-700 hover:border-amber-700/60 transition disabled:opacity-40"
+                              title={`Re-run the real pipeline pinned to commit ${dep.commit}`}
+                            >
+                              <Undo2 className="w-3 h-3" />
+                              Rollback here
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* failure reason — the real stderr tail */}
+                    {dep.status === 'failed' && dep.failureReason && (
+                      <p className="mt-2 text-[11px] font-mono text-red-400/90 bg-red-950/20 border border-red-900/30 rounded-lg px-3 py-2 break-words">
+                        {dep.failureReason}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!service.repoUrl && (
+              <p className="mt-4 text-[11px] text-zinc-500 font-mono">
+                This service has no git repo (builtin runner) — rollback needs a git-backed deployment.
+              </p>
+            )}
+            <p className="mt-4 text-[10px] text-zinc-600 font-mono border-t border-zinc-800 pt-3">
+              methodology: rows are written by the deployer itself at pipeline start/finish — durations are wall-clock
+              ms of the real clone/install/build/boot; failure reasons are tails of the real stderr. Rollback re-runs the
+              full pipeline with the repo checked out (detached HEAD) at the chosen commit — you can always roll forward
+              again by rolling back to a newer run.
+            </p>
           </div>
         </div>
       )}

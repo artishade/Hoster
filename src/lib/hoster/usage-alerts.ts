@@ -72,6 +72,52 @@ function tag(kind: 'h' | 'c' | 'b', v: number): string {
 
 const LEVEL_RANK: Record<string, number> = { info: 0, warn: 1, error: 2 };
 
+// ─── Fan-out retry with backoff ───────────────────────────────────────────────
+// Transient failures (5xx, connection resets, DNS hiccups) should not lose a
+// budget alert. Failed deliveries are retried on a fixed ladder (30s → 2m →
+// 10m — 4 attempts total including the first try) with a LogEntry receipt per
+// attempt. Retry state is in-memory: a control-plane restart drops pending
+// retries (the alert row itself is already persisted — only the delivery is
+// best-effort). A bounded pending-set guards against runaway pile-ups when a
+// target is hard-down: at most 16 queued deliveries per URL.
+
+const FANOUT_RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
+const FANOUT_MAX_PENDING_PER_URL = 16;
+
+interface FanOutState {
+  pending: Map<string, number>;
+}
+interface UsageAlertGlobalWithQueue extends UsageAlertGlobal {
+  __nxFanOutState?: FanOutState;
+}
+const fq = globalThis as UsageAlertGlobalWithQueue;
+function fanOutState(): FanOutState {
+  if (!fq.__nxFanOutState) fq.__nxFanOutState = { pending: new Map() };
+  return fq.__nxFanOutState;
+}
+
+async function postAlert(url: string, body: string): Promise<{ ok: boolean; status: number; statusText: string; error?: string }> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 5000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'nexushost-alerts/1.0' },
+      body,
+      signal: ctl.signal,
+    });
+    return { ok: res.ok, status: res.status, statusText: res.statusText };
+  } catch (err) {
+    return { ok: false, status: 0, statusText: '', error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function receipt(serviceId: string | null, level: 'info' | 'warn' | 'error', message: string): Promise<void> {
+  await db.logEntry.create({ data: { serviceId, scope: 'usage', level, message, source: 'alert-webhook' } }).catch(() => undefined);
+}
+
 async function fireAlert(
   cfg: AlertConfig,
   serviceId: string | null,
@@ -106,9 +152,10 @@ async function fireAlert(
   }
 }
 
-/** POST the alert to a webhook target. Records the delivery result as a
- *  LogEntry row. `override` selects the per-service target instead of the
- *  platform-wide one ('any' = no level filter — the service owner opted in). */
+/** POST the alert to a webhook target. Records a delivery receipt per attempt
+ *  and RETRIES transient failures on a 30s → 2m → 10m ladder. `override`
+ *  selects the per-service target instead of the platform-wide one ('any' =
+ *  no level filter — the service owner opted in). */
 async function fanOutAlert(
   cfg: AlertConfig,
   serviceId: string | null,
@@ -122,6 +169,8 @@ async function fanOutAlert(
   if (minLevel === 'none') return; // platform fan-out disabled in config
   if (minLevel !== 'any' && (LEVEL_RANK[level] ?? 0) < (LEVEL_RANK[minLevel] ?? 99)) return;
 
+  const targetLabel = override ? 'service target' : 'platform target';
+  const urlLabel = url.replace(/^https?:\/\//, '').slice(0, 60);
   const body = JSON.stringify({
     type: 'usage-alert',
     target: override?.target ?? 'platform',
@@ -130,37 +179,60 @@ async function fanOutAlert(
     message,
     timestamp: new Date().toISOString(),
   });
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 5000);
-  const urlLabel = url.replace(/^https?:\/\//, '').slice(0, 60);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': 'nexushost-alerts/1.0' },
-      body,
-      signal: ctl.signal,
-    });
-    await db.logEntry.create({
-      data: {
+  await attemptFanOut(serviceId, level, targetLabel, url, urlLabel, body, 0);
+}
+
+/** One delivery attempt + receipts + (bounded) retry scheduling. */
+async function attemptFanOut(
+  serviceId: string | null,
+  level: 'info' | 'warn' | 'error',
+  targetLabel: string,
+  url: string,
+  urlLabel: string,
+  body: string,
+  attempt: number
+): Promise<void> {
+  const total = FANOUT_RETRY_DELAYS_MS.length;
+  const res = await postAlert(url, body);
+  if (res.ok) {
+    await receipt(
+      serviceId,
+      'info',
+      `alert-webhook ▸ ${targetLabel} ${attempt > 0 ? `retry ${attempt}/${total} ` : ''}delivered ${level} alert → ${res.status} ${res.statusText || ''} (${urlLabel})`
+    );
+    return;
+  }
+
+  const why = res.error ?? (`${res.status} ${res.statusText || ''}`.trim() || `HTTP ${res.status}`);
+  if (attempt < total) {
+    const delayMs = FANOUT_RETRY_DELAYS_MS[attempt];
+    const pending = fanOutState().pending;
+    const queued = pending.get(url) ?? 0;
+    if (queued >= FANOUT_MAX_PENDING_PER_URL) {
+      await receipt(
         serviceId,
-        scope: 'usage',
-        level: res.ok ? 'info' : 'warn',
-        message: `alert-webhook ▸ ${override ? 'service target' : 'platform target'} delivered ${level} alert → ${res.status} ${res.statusText || ''} (${urlLabel})`,
-        source: 'alert-webhook',
-      },
-    }).catch(() => undefined);
-  } catch (err) {
-    await db.logEntry.create({
-      data: {
-        serviceId,
-        scope: 'usage',
-        level: 'warn',
-        message: `alert-webhook ▸ ${override ? 'service target' : 'platform target'} fan-out failed: ${err instanceof Error ? err.message : String(err)} (${urlLabel})`,
-        source: 'alert-webhook',
-      },
-    }).catch(() => undefined);
-  } finally {
-    clearTimeout(timer);
+        'warn',
+        `alert-webhook ▸ ${targetLabel} fan-out failed (${why}) — retry queue full for this target (${queued} pending), giving up (${urlLabel})`
+      );
+      return;
+    }
+    pending.set(url, queued + 1);
+    await receipt(
+      serviceId,
+      'warn',
+      `alert-webhook ▸ ${targetLabel} fan-out failed: ${why} — retrying ${attempt + 1}/${total} in ${Math.round(delayMs / 1000)}s (${urlLabel})`
+    );
+    const t = setTimeout(() => {
+      pending.set(url, Math.max(0, (pending.get(url) ?? 1) - 1));
+      void attemptFanOut(serviceId, level, targetLabel, url, urlLabel, body, attempt + 1).catch(() => undefined);
+    }, delayMs);
+    t.unref?.();
+  } else {
+    await receipt(
+      serviceId,
+      'warn',
+      `alert-webhook ▸ ${targetLabel} fan-out gave up after ${total + 1} attempts: ${why} (${urlLabel})`
+    );
   }
 }
 

@@ -289,9 +289,12 @@ export default function ServicesList({
                         <span className="text-zinc-600">({srv.commitHash})</span>
                       </div>
                       <span className="text-zinc-700">&bull;</span>
-                      <div className="flex items-center gap-1 text-zinc-400">
+                      <div className="flex items-center gap-1 text-zinc-400" title={srv.repoUrl ? `${srv.deploymentCount} successful pipeline runs on record` : undefined}>
                         <Clock className="w-3 h-3 text-zinc-500" />
                         <span>Deployed {srv.deployedAt}</span>
+                        {srv.repoUrl && srv.deploymentCount > 0 && (
+                          <span className="text-zinc-600">· {srv.deploymentCount} run{srv.deploymentCount === 1 ? '' : 's'}</span>
+                        )}
                       </div>
                       {srv.customDomains.length > 0 && (
                         <>

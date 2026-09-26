@@ -129,7 +129,7 @@ export async function triggerRedeploy(serviceId: string, reason: string): Promis
     port: fresh.port,
     envVarsJson: fresh.envVarsJson,
     volumeMountsJson: fresh.volumeMountsJson,
-  }).catch(async (err) => {
+  }, { trigger: 'webhook' }).catch(async (err) => {
     console.error('[webhooks] redeploy crashed', err);
     await db.service.update({ where: { id: serviceId }, data: { status: 'failed' } }).catch(() => {});
   });

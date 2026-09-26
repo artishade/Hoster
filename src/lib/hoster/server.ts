@@ -127,7 +127,13 @@ export const TIER_TO_PROVIDER: Record<string, string> = {
 export function serializeService(
   row: PrismaService,
   _host: LiveSystemMetrics,
-  opts?: { statusOverride?: string; withMetrics?: boolean }
+  opts?: {
+    statusOverride?: string;
+    withMetrics?: boolean;
+    /** last REAL successful pipeline run (from the Deployment table) — used for
+     *  the honest "Deployed X ago" on service cards (falls back to creation time). */
+    lastSuccessDeploy?: { at: Date; count: number } | null;
+  }
 ): Service {
   const status = (opts?.statusOverride ?? row.status) as Service['status'];
   const spec = tierSpec(row.hardwareTier);
@@ -152,7 +158,8 @@ export function serializeService(
     branch: row.branch,
     commitHash: row.commitHash,
     commitMessage: row.commitMessage,
-    deployedAt: formatRelative(row.createdAt),
+    deployedAt: formatRelative(opts?.lastSuccessDeploy?.at ?? row.createdAt),
+    deploymentCount: opts?.lastSuccessDeploy?.count ?? 0,
     url: row.url,
     ingressPath: `/api/ingress/${row.name}`,
     runtime: runtime ?? undefined,

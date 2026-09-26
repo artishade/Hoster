@@ -16,6 +16,7 @@ import type {
   ProviderActionResult,
   NewProviderPayload,
   UsageReport,
+  DeploymentHistory,
 } from '@/lib/hoster/types';
 import type { DeployPayload as ModalDeployPayload } from '@/components/hoster/DeployModal';
 
@@ -525,5 +526,29 @@ export function useDeleteProvider() {
       }
     },
     onSuccess: () => invalidate('providers', 'logs'),
+  });
+}
+
+// ─── Deployment history & rollback ───────────────────────────────────────────
+
+export function useDeploymentHistory(serviceId: string | null) {
+  return useQuery({
+    queryKey: ['deployments', serviceId],
+    queryFn: () => api<DeploymentHistory>(`/api/services/${serviceId}/deployments?limit=20`),
+    enabled: !!serviceId,
+    refetchInterval: 4000,
+    ...QUERY_OPTS,
+  });
+}
+
+export function useRollbackDeployment() {
+  const invalidate = useInvalidate();
+  return useMutation({
+    mutationFn: ({ id, deploymentId }: { id: string; deploymentId: string }) =>
+      api<{ ok: true; message: string; commit: string }>(`/api/services/${id}/rollback`, {
+        method: 'POST',
+        body: JSON.stringify({ deploymentId }),
+      }),
+    onSuccess: () => invalidate('services', 'deployments', 'logs'),
   });
 }

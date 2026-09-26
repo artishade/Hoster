@@ -466,13 +466,68 @@ async function setStatus(serviceId: string, status: string, extra: Record<string
   await db.service.update({ where: { id: serviceId }, data: { status, ...extra } });
 }
 
+// ─── Deployment history ──────────────────────────────────────────────────────
+// Every startDeployment() run creates ONE Deployment row that is finalized on
+// success or failure. The UI renders the table and offers one-click rollback
+// (git fetch of a past SHA + checkout) — see deployments API routes.
+
+export interface DeploymentOpts {
+  /** who started this run: deploy | redeploy | webhook | self-heal | rollback | boot */
+  trigger?: string;
+  /** short SHA to check out instead of the branch tip (rollback path) */
+  checkoutCommit?: string;
+}
+
+export function isDeploymentBusy(serviceId: string): boolean {
+  return busy.has(serviceId);
+}
+
+async function createDeploymentRecord(serviceId: string, trigger: string): Promise<string | null> {
+  try {
+    const row = await db.deployment.create({ data: { serviceId, trigger } });
+    return row.id;
+  } catch {
+    return null; // history is best-effort — the pipeline itself must never stall
+  }
+}
+
+async function finishDeployment(
+  deploymentId: string | null,
+  patch: { status: 'success' | 'failed'; commit?: string; commitMessage?: string; failureReason?: string },
+  startedAt: number
+): Promise<void> {
+  if (!deploymentId) return;
+  try {
+    await db.deployment.update({
+      where: { id: deploymentId },
+      data: {
+        status: patch.status,
+        commit: patch.commit ?? '',
+        commitMessage: (patch.commitMessage ?? '').slice(0, 200),
+        failureReason: (patch.failureReason ?? '').slice(0, 500),
+        finishedAt: new Date(),
+        durationMs: Date.now() - startedAt,
+      },
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
 /**
  * Execute the REAL deployment pipeline for a service. Fire-and-forget safe:
  * every transition is persisted; failures set status=failed with real stderr.
+ * Each run is recorded in the Deployment table (history + rollback source).
  */
-export async function startDeployment(svc: DeployableService): Promise<void> {
+export async function startDeployment(svc: DeployableService, opts: DeploymentOpts = {}): Promise<void> {
   if (busy.has(svc.id)) return;
   busy.add(svc.id);
+  const trigger = opts.trigger ?? 'deploy';
+  const deploymentId = await createDeploymentRecord(svc.id, trigger);
+  const startedAt = Date.now();
+  const fail = async (reason: string): Promise<void> => {
+    await finishDeployment(deploymentId, { status: 'failed', failureReason: reason }, startedAt);
+  };
   const workspace = path.join(DEPLOY_ROOT, svc.name);
   const repoDir = path.join(workspace, 'repo');
   const envVars = safeParse<EnvVar[]>(svc.envVarsJson, []);
@@ -492,10 +547,46 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
     if (clone.code !== 0) {
       const tail = tailText(clone.stderr, 600) || tailText(clone.stdout, 600) || `git exited with code ${clone.code}`;
       await dlog(svc.id, `Clone FAILED (exit ${clone.code}): ${tail}`, 'error');
+      await fail(`clone failed: ${tail}`);
       await setStatus(svc.id, 'failed');
       return;
     }
     await dlog(svc.id, `Clone OK — repo on disk at ${repoDir} (${(await dirSizeMb(repoDir)).toFixed(1)} MB)`);
+
+    // ── 1b. rollback: check out the requested commit instead of the tip ────
+    if (opts.checkoutCommit) {
+      const want = opts.checkoutCommit.trim();
+      // `git fetch origin <sha>` only works with FULL shas on servers that
+      // allow SHA-in-want (and never with short shas — they parse as ref
+      // names). The portable approach: deepen the branch history so the
+      // commit exists locally, then `checkout --detach` resolves it by any
+      // unique prefix.
+      const ROLLBACK_HISTORY_DEPTH = 60;
+      await dlog(svc.id, `Rollback: deepening branch history (git fetch --depth ${ROLLBACK_HISTORY_DEPTH} origin ${svc.branch}) to resolve commit ${want}...`);
+      const deepen = await run('git', ['-C', repoDir, 'fetch', '--depth', String(ROLLBACK_HISTORY_DEPTH), 'origin', svc.branch], {
+        timeoutMs: GIT_TIMEOUT_MS,
+        onLine: (line) => void dlog(svc.id, `[git fetch] ${line}`),
+      });
+      if (deepen.code !== 0) {
+        const tail = tailText(deepen.stderr, 500) || `git fetch exited with code ${deepen.code}`;
+        await dlog(svc.id, `Rollback history fetch FAILED: ${tail}`, 'error');
+        await fail(`rollback fetch of ${want} failed: ${tail}`);
+        await setStatus(svc.id, 'failed');
+        return;
+      }
+      const co = await run('git', ['-C', repoDir, 'checkout', '--detach', want], { timeoutMs: 30_000 });
+      if (co.code !== 0) {
+        const tail = tailText(co.stderr, 500) || `git checkout exited with code ${co.code}`;
+        const reason = tail.includes('unknown revision')
+          ? `commit ${want} not found within the last ${ROLLBACK_HISTORY_DEPTH} commits of branch ${svc.branch} (shallow rollback window exceeded)`
+          : `rollback checkout of ${want} failed: ${tail}`;
+        await dlog(svc.id, `Rollback checkout FAILED: ${reason}`, 'error');
+        await fail(reason);
+        await setStatus(svc.id, 'failed');
+        return;
+      }
+      await dlog(svc.id, `Rollback: working tree is now at ${want} (detached HEAD).`);
+    }
 
     // ── 2. real commit metadata ─────────────────────────────────────────
     const hashRes = await run('git', ['-C', repoDir, 'rev-parse', '--short', 'HEAD'], { timeoutMs: 10_000 });
@@ -522,6 +613,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
 
     if (detected.runtime === 'unknown' && !startCmd) {
       await dlog(svc.id, 'No runnable entrypoint found (no package.json start/dev, no python app, no index.html). Deployment failed.', 'error');
+      await fail('no runnable entrypoint found (no package.json start/dev, no python app, no index.html)');
       await setStatus(svc.id, 'failed');
       return;
     }
@@ -545,6 +637,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
         });
         if (install2.code !== 0) {
           await dlog(svc.id, `Install FAILED: ${tailText(install2.stderr, 600)}`, 'error');
+          await fail(`install failed: ${tailText(install2.stderr, 600)}`);
           await setStatus(svc.id, 'failed');
           return;
         }
@@ -670,6 +763,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       });
       if (build.code !== 0) {
         await dlog(svc.id, `Build FAILED (exit ${build.code}): ${tailText(build.stderr, 800)}`, 'error');
+        await fail(`build failed (exit ${build.code}): ${tailText(build.stderr, 800)}`);
         await setStatus(svc.id, 'failed');
         return;
       }
@@ -756,7 +850,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
             await dlog(svc.id, `App process exited unexpectedly (code=${code ?? '?'} signal=${signal ?? '?'}) — SELF-HEALING with a fresh deployment (bounded: max 3 per 2h).`, 'warn');
             await setStatus(svc.id, 'building');
             const fresh = await db.service.findUnique({ where: { id: svc.id } }).catch(() => null);
-            if (fresh) void startDeployment(fresh).catch(() => {});
+            if (fresh) void startDeployment(fresh, { trigger: 'self-heal' }).catch(() => {});
           } else {
             await dlog(svc.id, `App process exited (code=${code ?? '?'} signal=${signal ?? '?'}) — self-heal budget exhausted (3 restarts in the last 2h), marking failed.`, 'error');
             await setStatus(svc.id, 'failed');
@@ -769,6 +863,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
     if (!ok) {
       await dlog(svc.id, `App did not answer on port ${port} within ${BOOT_TIMEOUT_MS / 1000}s — killing process tree and marking failed.`, 'error');
       killTree(child);
+      await fail(`HTTP readiness probe failed: app did not answer on port ${port} within ${BOOT_TIMEOUT_MS / 1000}s`);
       await setStatus(svc.id, 'failed');
       return;
     }
@@ -798,6 +893,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
         runtimeJson: JSON.stringify(runtime),
       },
     });
+    await finishDeployment(deploymentId, { status: 'success', commit: commitHash, commitMessage }, startedAt);
     await dlog(
       svc.id,
       `Service is LIVE — ${svc.name} answering on 127.0.0.1:${port} (pid ${pid}, commit ${commitHash}). Ingress: /api/ingress/${svc.name} · host route: ${svc.name}.nexushost.dev`
@@ -805,6 +901,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
   } catch (err) {
     console.error(`[deployer] pipeline error for ${svc.name}`, err);
     await dlog(svc.id, `Deployer error: ${(err as Error).message}`, 'error');
+    await fail(`deployer error: ${(err as Error).message}`);
     await setStatus(svc.id, 'failed').catch(() => {});
   } finally {
     busy.delete(svc.id);
@@ -1014,7 +1111,7 @@ async function adoptOrphanedDeployment(row: DeployableService & { runtimeJson: s
     }
     await dlog(row.id, `Watchdog: app process (pid ${runtime.pid}) from a previous control-plane run is gone — self-healing: relaunching the deployment.`, 'warn');
     await setStatus(row.id, 'building');
-    void startDeployment(row).catch(() => {});
+    void startDeployment(row, { trigger: 'self-heal' }).catch(() => {});
     return;
   }
 
@@ -1033,7 +1130,7 @@ async function adoptOrphanedDeployment(row: DeployableService & { runtimeJson: s
     );
     killTreeByPid(runtime.pid);
     await setStatus(row.id, 'building');
-    void startDeployment(row).catch(() => {});
+    void startDeployment(row, { trigger: 'self-heal' }).catch(() => {});
     return;
   }
 
@@ -1154,7 +1251,7 @@ function watchAdoptedProcess(serviceId: string, pid: number): void {
         if (maySelfHeal(serviceId)) {
           await dlog(serviceId, `Adopted app process exited (pid ${pid}) — SELF-HEALING with a fresh deployment (bounded: max 3 per 2h).`, 'warn');
           await setStatus(serviceId, 'building');
-          void startDeployment(row).catch(() => {});
+          void startDeployment(row, { trigger: 'self-heal' }).catch(() => {});
         } else {
           await dlog(serviceId, `Adopted app process exited (pid ${pid}) — self-heal budget exhausted (3 restarts in the last 2h), staying failed.`, 'error');
           await setStatus(serviceId, 'failed');
@@ -1261,7 +1358,7 @@ export function ensureDeployWatchdog(): void {
           'warn'
         );
         await setStatus(row.id, 'building', { lifecycleStartedAt: new Date() });
-        void startDeployment(row).catch(() => {});
+        void startDeployment(row, { trigger: 'boot' }).catch(() => {});
       }
     } catch (err) {
       console.error('[deployer] watchdog tick failed', err);

@@ -264,6 +264,7 @@ export interface Service {
   repoUrl: string;
   branch: string;
   commitHash: string;
+  deploymentCount: number;
   commitMessage: string;
   deployedAt: string;
   url: string;
@@ -395,6 +396,38 @@ export interface HostHistoryPoint {
   diskTotalGb: number;
   netInMb?: number | null;
   netOutMb?: number | null;
+}
+
+/** REAL deployment history (GET /api/services/<id>/deployments). */
+export interface DeploymentRecord {
+  id: string;
+  trigger: 'deploy' | 'redeploy' | 'webhook' | 'self-heal' | 'rollback' | 'boot' | string;
+  status: 'pending' | 'success' | 'failed' | string;
+  commit: string;
+  commitMessage: string;
+  failureReason: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number;
+  isCurrent: boolean;
+}
+
+export interface DeploymentHistory {
+  service: {
+    id: string;
+    name: string;
+    currentCommit: string;
+    status: string;
+    hasRepo: boolean;
+  };
+  deployments: DeploymentRecord[];
+  stats: {
+    total: number;
+    success: number;
+    failed: number;
+    rollbacks: number;
+    avgDurationMs: number;
+  };
 }
 
 /** REAL usage metering report (GET /api/usage). */
