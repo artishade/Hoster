@@ -45,6 +45,98 @@ interface DeployGlobal {
   __nxDeploysBusy?: Set<string>;
   __nxDeployChildren?: Map<string, ChildProcess>;
   __nxDeployOps?: Map<string, number>; // real op counters per service
+  __nxLogTails?: Map<string, { offset: number; timer: NodeJS.Timeout }>;
+  __nxSelfHeals?: Map<string, number[]>; // timestamps of self-heals per service
+}
+/** Path of a service's persistent app log file. */
+function appLogPath(workspace: string): string {
+  return path.join(workspace, 'app.log');
+}
+
+/**
+ * Tail a service's app.log file → LogEntry rows (source 'app').
+ * Survives control-plane restarts, streams at ~1s granularity, and caps
+ * the persisted line rate so a chatty app can't flood the DB.
+ */
+function tailAppLog(serviceId: string, logPath: string): void {
+  const g = globalThis as DeployGlobal;
+  const tails = g.__nxLogTails ?? new Map<string, { offset: number; timer: NodeJS.Timeout }>();
+  g.__nxLogTails = tails;
+
+  const prev = tails.get(serviceId);
+  if (prev) {
+    clearInterval(prev.timer);
+    tails.delete(serviceId);
+  }
+
+  // start at current end (history is on disk; only NEW lines stream)
+  let offset = 0;
+  try {
+    offset = fs.statSync(logPath).size;
+  } catch {
+    offset = 0;
+  }
+
+  const BUDGET_WINDOW_MS = 30_000;
+  const BUDGET_LINES = 60; // max persisted lines per 30s window
+  const budgetTimes: number[] = [];
+
+  const timer = setInterval(() => {
+    try {
+      const st = fs.statSync(logPath);
+      if (st.size <= offset) return;
+      const fd = fs.openSync(logPath, 'r');
+      const length = Math.min(st.size - offset, 512 * 1024);
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, offset);
+      fs.closeSync(fd);
+      offset += length;
+      const text = buf.toString('utf8');
+
+      // trim the in-window budget
+      const now = Date.now();
+      while (budgetTimes.length && now - budgetTimes[0] > BUDGET_WINDOW_MS) budgetTimes.shift();
+
+      for (const line of text.split(/[\r\n]+/)) {
+        if (!line.trim()) continue;
+        if (budgetTimes.length >= BUDGET_LINES) continue; // rate-limited, not lost on disk
+        budgetTimes.push(now);
+        void writeRunnerLog(serviceId, line.trimEnd().slice(0, 2000), 'app');
+      }
+    } catch {
+      /* file rotated/removed */
+    }
+  }, 1000);
+  timer.unref?.();
+  tails.set(serviceId, { offset, timer });
+}
+
+/** Stop the log tailer for a service (process exited / service stopped). */
+function stopAppLogTail(serviceId: string): void {
+  const g = globalThis as DeployGlobal;
+  const tails = g.__nxLogTails;
+  const t = tails?.get(serviceId);
+  if (t) {
+    clearInterval(t.timer);
+    tails?.delete(serviceId);
+  }
+}
+
+/** Bounded self-heal accounting: max 3 restarts per 2h per service. */
+function maySelfHeal(serviceId: string): boolean {
+  const g = globalThis as DeployGlobal;
+  const heals = g.__nxSelfHeals ?? new Map<string, number[]>();
+  g.__nxSelfHeals = heals;
+  const now = Date.now();
+  const WINDOW_MS = 2 * 60 * 60 * 1000;
+  const times = (heals.get(serviceId) ?? []).filter((t) => now - t < WINDOW_MS);
+  if (times.length >= 3) {
+    heals.set(serviceId, times);
+    return false; // chronic crashing — stop auto-restarting
+  }
+  times.push(now);
+  heals.set(serviceId, times);
+  return true;
 }
 const g = globalThis as DeployGlobal;
 const deploys = g.__nxDeploys ?? new Map<string, DeployHandle>();
@@ -241,7 +333,7 @@ http.createServer((req, res) => {
   });
 }).listen(${port}, '127.0.0.1', () => console.log('static server on ' + ${port}));
 `;
-  const child = spawn('node', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env }, cwd: repoDir });
+  const child = spawn('node', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env }, cwd: repoDir, detached: true });
   child.stdout?.on('data', (c: Buffer) => {
     const line = c.toString('utf8').trim();
     if (line) void writeRunnerLog(serviceId, line, 'app');
@@ -401,6 +493,12 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
     await setStatus(svc.id, 'deploying');
     await stopRuntime(svc); // release any previous listener
 
+    // reap stray processes still holding this workspace (pre-restart zombies)
+    const strays = killStrayWorkspaceProcesses(workspace);
+    if (strays > 0) {
+      await dlog(svc.id, `Reaped ${strays} stray process(es) left in the workspace from a previous run before spawning.`, 'warn');
+    }
+
     const port = svc.port && svc.port > 1024 && svc.port < 65536 ? await portOrAllocate(svc) : await portOrAllocate(svc);
     const childEnv: Record<string, string> = {
       PORT: String(port),
@@ -430,19 +528,23 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
     if (detected.runtime === 'static') {
       child = spawnStaticServer(repoDir, port, svc.id);
     } else {
+      // App stdout/stderr go straight to a FILE (restart-proof): the log
+      // survives control-plane restarts, a tailer streams it into LogEntry,
+      // and the app can never EPIPE-crash when the parent server dies.
+      const logFd = fs.openSync(appLogPath(workspace), 'a');
       child = spawn('bash', ['-lc', startCmd], {
         cwd: repoDir,
         env: { ...process.env, ...childEnv },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', logFd, logFd],
         detached: true, // own process group → clean tree kill
       });
-      child.stdout?.on('data', (c: Buffer) => {
-        for (const line of c.toString('utf8').split(/[\r\n]+/)) if (line.trim()) void writeRunnerLog(svc.id, line.trimEnd(), 'app');
-      });
-      child.stderr?.on('data', (c: Buffer) => {
-        for (const line of c.toString('utf8').split(/[\r\n]+/)) if (line.trim()) void writeRunnerLog(svc.id, line.trimEnd(), 'app');
-      });
+      try {
+        fs.closeSync(logFd);
+      } catch {
+        /* fd dup'ed into the child */
+      }
     }
+    tailAppLog(svc.id, appLogPath(workspace));
 
     children.set(svc.id, child);
     const pid = child.pid ?? -1;
@@ -452,6 +554,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       children.delete(svc.id);
       deploys.delete(svc.id);
       forgetPid(pid);
+      stopAppLogTail(svc.id);
       void (async () => {
         // Guard against stale exit handlers: only fail the service if the DB
         // still points at THIS process (a restart replaces runtimeJson first).
@@ -460,8 +563,15 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
         const runtime = safeParse<{ pid?: number } | null>(row.runtimeJson, null);
         if (runtime?.pid !== pid) return; // superseded by a newer deployment
         if (row.status === 'running') {
-          await dlog(svc.id, `App process exited unexpectedly (code=${code ?? '?'} signal=${signal ?? '?'}) — marking service failed.`, 'error');
-          await setStatus(svc.id, 'failed');
+          if (maySelfHeal(svc.id)) {
+            await dlog(svc.id, `App process exited unexpectedly (code=${code ?? '?'} signal=${signal ?? '?'}) — SELF-HEALING with a fresh deployment (bounded: max 3 per 2h).`, 'warn');
+            await setStatus(svc.id, 'building');
+            const fresh = await db.service.findUnique({ where: { id: svc.id } }).catch(() => null);
+            if (fresh) void startDeployment(fresh).catch(() => {});
+          } else {
+            await dlog(svc.id, `App process exited (code=${code ?? '?'} signal=${signal ?? '?'}) — self-heal budget exhausted (3 restarts in the last 2h), marking failed.`, 'error');
+            await setStatus(svc.id, 'failed');
+          }
         }
       })();
     });
@@ -548,6 +658,7 @@ function resolveWorkerPid(rootPid: number): number {
 }
 
 export async function stopDeployment(svc: { id: string; name: string }): Promise<void> {
+  stopAppLogTail(svc.id);
   const child = children.get(svc.id);
   if (child) {
     killTree(child);
@@ -594,6 +705,178 @@ export function deployProcessStats(serviceId: string): { cpuPercent: number; ram
   return readProcStats(workerPid);
 }
 
+// ─── orphan adoption: re-bind surviving processes after a restart ──────────
+
+/**
+ * When the control plane restarts (dev reload, crash, deploy), its in-memory
+ * deploy map is lost — but the detached app processes SURVIVE (own process
+ * groups). This re-adopts them: metrics, stop/restart and crash detection all
+ * come back online without disturbing the running app.
+ */
+async function adoptOrphanedDeployment(row: DeployableService & { runtimeJson: string | null }): Promise<void> {
+  if (deploys.has(row.id) || busy.has(row.id)) return;
+  const runtime = safeParse<(ServiceRuntime & { commit?: string; repoDir?: string }) | null>(row.runtimeJson, null);
+  if (!runtime || runtime.mode !== 'git-deploy' || typeof runtime.pid !== 'number') return;
+
+  if (!isPidAlive(runtime.pid)) {
+    if (!maySelfHeal(row.id)) {
+      await dlog(row.id, `Watchdog: app process (pid ${runtime.pid}) from a previous control-plane run is gone — self-heal budget exhausted, marking failed.`, 'error');
+      await setStatus(row.id, 'failed');
+      return;
+    }
+    await dlog(row.id, `Watchdog: app process (pid ${runtime.pid}) from a previous control-plane run is gone — self-healing: relaunching the deployment.`, 'warn');
+    await setStatus(row.id, 'building');
+    void startDeployment(row).catch(() => {});
+    return;
+  }
+
+  // the pid exists — verify it is REALLY our app by probing its port
+  const answers = await fetch(`http://127.0.0.1:${runtime.port}/`, {
+    signal: AbortSignal.timeout(1500),
+    cache: 'no-store',
+    redirect: 'manual',
+  }).catch(() => null);
+  if (!answers) {
+    // zombie: process alive but not serving — kill the tree and redeploy
+    await dlog(
+      row.id,
+      `Watchdog: process pid ${runtime.pid} is alive but port ${runtime.port} does not answer (zombie after restart) — killing the tree and SELF-HEALING with a fresh deployment.`,
+      'warn'
+    );
+    killTreeByPid(runtime.pid);
+    await setStatus(row.id, 'building');
+    void startDeployment(row).catch(() => {});
+    return;
+  }
+
+  deploys.set(row.id, {
+    pid: runtime.pid,
+    port: runtime.port,
+    startedAt: runtime.startedAt,
+    commit: runtime.commit ?? '',
+    repoDir: runtime.repoDir ?? '',
+  });
+  watchAdoptedProcess(row.id, runtime.pid);
+  // resume streaming the persistent app.log into the activity feed
+  const ws = runtime.repoDir ? path.dirname(runtime.repoDir) : path.join(DEPLOY_ROOT, row.name);
+  tailAppLog(row.id, appLogPath(ws));
+  await dlog(
+    row.id,
+    `Watchdog: ADOPTED surviving app process (pid ${runtime.pid}, port ${runtime.port}) after control-plane restart — metrics, health checks and lifecycle control re-attached without restarting the app.`
+  );
+}
+
+/**
+ * Kill a process tree by root pid. SAFE group semantics:
+ *  - if the pid IS its own process-group leader (detached spawns), kill the
+ *    whole group in one shot — bash/bun/node all die together
+ *  - otherwise (legacy non-detached processes that share the control plane's
+ *    group) walk /proc children and kill only THIS tree, pid by pid — never
+ *    the shared group
+ */
+function killTreeByPid(pid: number): void {
+  let pgid: number | null = null;
+  try {
+    // pgid is field 5 of /proc/<pid>/stat (comm may contain spaces → parse from end)
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const close = stat.lastIndexOf(')');
+    pgid = Number(stat.slice(close + 2).split(/\s+/)[2]);
+    if (!Number.isFinite(pgid) || pgid <= 0) pgid = null;
+  } catch {
+    pgid = null;
+  }
+
+  if (pgid !== null && pgid === pid) {
+    // own group leader → group kill is safe and complete
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch {
+      /* fall through to targeted kill */
+    }
+  }
+
+  // targeted: kill this pid + every descendant (never the shared group)
+  const seen = new Set<number>();
+  const killRecursive = (p: number): void => {
+    if (seen.has(p)) return;
+    seen.add(p);
+    try {
+      const childrenRaw = fs.readFileSync(`/proc/${p}/task/${p}/children`, 'utf8').trim();
+      for (const kid of childrenRaw.split(/\s+/).filter(Boolean).map(Number)) killRecursive(kid);
+    } catch {
+      /* no children file */
+    }
+    try {
+      process.kill(p, 'SIGKILL');
+    } catch {
+      /* already dead */
+    }
+  };
+  killRecursive(pid);
+}
+
+/**
+ * Kill stray processes still running inside a service workspace (e.g. left
+ * behind by a pre-restart crash). A process is stray when its cwd is inside
+ * the workspace directory — the control plane's own cwd never matches.
+ */
+function killStrayWorkspaceProcesses(workspaceDir: string): number {
+  let killed = 0;
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+  } catch {
+    return 0;
+  }
+  for (const pidStr of entries) {
+    const pid = Number(pidStr);
+    if (pid === process.pid) continue;
+    try {
+      const cwd = fs.readlinkSync(`/proc/${pidStr}/cwd`);
+      if (cwd && (cwd === workspaceDir || cwd.startsWith(workspaceDir + '/'))) {
+        killTreeByPid(pid);
+        killed += 1;
+      }
+    } catch {
+      /* unreadable cwd — not ours */
+    }
+  }
+  return killed;
+}
+
+/** Poll-based exit detection for adopted (not spawned by us) processes. */
+function watchAdoptedProcess(serviceId: string, pid: number): void {
+  const timer = setInterval(() => {
+    const handle = deploys.get(serviceId);
+    if (!handle || handle.pid !== pid) {
+      clearInterval(timer);
+      return;
+    }
+    if (!isPidAlive(pid)) {
+      clearInterval(timer);
+      deploys.delete(serviceId);
+      forgetPid(pid);
+      void (async () => {
+        const row = await db.service.findUnique({ where: { id: serviceId } }).catch(() => null);
+        if (!row) return;
+        const rt = safeParse<{ pid?: number } | null>(row.runtimeJson, null);
+        if (rt?.pid !== pid) return; // superseded
+        if (row.status !== 'running') return;
+        if (maySelfHeal(serviceId)) {
+          await dlog(serviceId, `Adopted app process exited (pid ${pid}) — SELF-HEALING with a fresh deployment (bounded: max 3 per 2h).`, 'warn');
+          await setStatus(serviceId, 'building');
+          void startDeployment(row).catch(() => {});
+        } else {
+          await dlog(serviceId, `Adopted app process exited (pid ${pid}) — self-heal budget exhausted (3 restarts in the last 2h), staying failed.`, 'error');
+          await setStatus(serviceId, 'failed');
+        }
+      })();
+    }
+  }, 5_000);
+  timer.unref?.();
+}
+
 // ─── watchdog: reconcile running git-deploy services ─────────────────────────
 
 type WatchdogGlobal = typeof globalThis & { __nxDeployWatchdog?: { timer: NodeJS.Timeout; busy: boolean } };
@@ -603,7 +886,8 @@ const wg = globalThis as WatchdogGlobal;
  * Started once per process. Every 10s it verifies that every service in
  * "running" state with a git deployment still has a live process + answering
  * port. Crashed processes are marked failed with a real log entry; the
- * runtimeJson health flag always reflects the truth.
+ * runtimeJson health flag always reflects the truth. Surviving orphans from a
+ * previous control-plane run are adopted (metrics + lifecycle re-attached).
  */
 export function ensureDeployWatchdog(): void {
   if (wg.__nxDeployWatchdog) return;
@@ -615,7 +899,14 @@ export function ensureDeployWatchdog(): void {
       const rows = await db.service.findMany({ where: { status: 'running' } });
       for (const row of rows) {
         const handle = deploys.get(row.id);
-        if (!handle) continue; // builtin-runner services are handled by runtime.ts
+        if (!handle) {
+          if (row.repoUrl) {
+            // git-deployed but no in-memory handle → orphaned by a restart:
+            // adopt the survivor, or self-heal (kill zombie + redeploy)
+            await adoptOrphanedDeployment(row);
+          }
+          continue; // builtin-runner services are handled by runtime.ts
+        }
         if (!isPidAlive(handle.pid)) {
           // process died without an exit event reaching us (SIGKILL of parent, etc.)
           deploys.delete(row.id);

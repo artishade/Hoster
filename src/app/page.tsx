@@ -11,6 +11,7 @@ import DatabasesView from '@/components/hoster/DatabasesView';
 import StorageView from '@/components/hoster/StorageView';
 import CustomDomainsView from '@/components/hoster/CustomDomainsView';
 import EdgeNetworkView from '@/components/hoster/EdgeNetworkView';
+import ActivityFeedView from '@/components/hoster/ActivityFeedView';
 import McpInspectorView from '@/components/hoster/McpInspectorView';
 import CloudNodesView from '@/components/hoster/CloudNodesView';
 import SettingsView from '@/components/hoster/SettingsView';
@@ -551,6 +552,9 @@ export default function HomePage() {
 
             {/* EDGE NETWORK VIEW */}
             {currentTab === 'edge' && <EdgeNetworkView />}
+
+            {/* ACTIVITY & EVENTS FEED VIEW */}
+            {currentTab === 'activity' && <ActivityFeedView />}
 
             {/* MCP & PLUGIN STUDIO VIEW */}
             {currentTab === 'mcp-inspector' && (

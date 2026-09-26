@@ -11,6 +11,7 @@ import {
   S3BucketConfig 
 } from '@/lib/hoster/types';
 import { HARDWARE_SPECS } from '@/lib/hoster/hardware-specs';
+import type { HardwareSpec } from '@/lib/hoster/types';
 import { 
   X, 
   GitBranch, 
@@ -27,7 +28,8 @@ import {
   Sparkles,
   ArrowRight,
   ShieldCheck,
-  Flame
+  Flame,
+  Activity
 } from 'lucide-react';
 
 export interface DeployPayload {
@@ -101,6 +103,26 @@ export default function DeployModal({
   const [deployFailed, setDeployFailed] = useState(false);
   const [buildLogs, setBuildLogs] = useState<string[]>([]);
   const [buildProgress, setBuildProgress] = useState(0);
+
+  // REAL server-measured tier specs (falls back to the static import client-side)
+  const [liveSpecs, setLiveSpecs] = useState<Record<string, HardwareSpec> | null>(null);
+  useEffect(() => {
+    if (!isOpen || liveSpecs) return;
+    let cancelled = false;
+    fetch('/api/hardware-specs', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json) => {
+        if (cancelled || !json?.data?.specs) return;
+        const map: Record<string, HardwareSpec> = {};
+        for (const spec of json.data.specs as HardwareSpec[]) map[spec.id] = spec;
+        setLiveSpecs(map);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, liveSpecs]);
+  const specFor = (id: HardwareTier): HardwareSpec => (liveSpecs?.[id] ?? HARDWARE_SPECS[id]) as HardwareSpec;
 
   if (!isOpen) return null;
 
@@ -520,9 +542,12 @@ export default function DeployModal({
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {Object.values(HARDWARE_SPECS).map((spec) => {
+                  {Object.values(HARDWARE_SPECS).map((rawSpec) => {
+                    const spec = specFor(rawSpec.id);
                     const isGpu = spec.category === 'gpu';
                     const isSelected = hardwareTier === spec.id;
+                    const isFree = spec.priceHourly === 0;
+                    const isMeasured = !!liveSpecs?.[spec.id] && (spec.id === 'free-blitz' || spec.id === 'local-node');
 
                     return (
                       <button
@@ -533,30 +558,41 @@ export default function DeployModal({
                           isSelected
                             ? 'border-cyan-400 bg-cyan-950/30 ring-1 ring-cyan-400 shadow-md'
                             : 'border-zinc-800 bg-zinc-900/40 hover:border-zinc-700'
-                        }`}
+                        } ${isFree ? 'ring-1 ring-emerald-800/50' : ''}`}
                       >
                         <div>
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-bold text-zinc-100 flex items-center gap-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-zinc-100 flex items-center gap-1.5 min-w-0">
                               {isGpu ? (
-                                <Cpu className="w-4 h-4 text-emerald-400" />
+                                <Cpu className="w-4 h-4 text-emerald-400 shrink-0" />
                               ) : (
-                                <Server className="w-4 h-4 text-zinc-400" />
+                                <Server className="w-4 h-4 text-zinc-400 shrink-0" />
                               )}
-                              {spec.name}
+                              <span className="truncate">{spec.name}</span>
+                              {isFree && (
+                                <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-400 border border-emerald-800/60 shrink-0">
+                                  FREE
+                                </span>
+                              )}
                             </span>
-                            <span className="text-xs font-mono font-bold text-cyan-300">
-                              ${spec.priceHourly}/hr
+                            <span className={`text-xs font-mono font-bold shrink-0 ${isFree ? 'text-emerald-400' : 'text-cyan-300'}`}>
+                              {isFree ? '$0' : `$${spec.priceHourly}`}/hr
                             </span>
                           </div>
 
-                          <p className="text-[11px] text-zinc-400 font-mono mt-1">
+                          <p className="text-[11px] text-zinc-400 font-mono mt-1 flex items-center gap-1.5 flex-wrap">
+                            {isMeasured && (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-950/70 text-cyan-300 border border-cyan-800/60">
+                                <Activity className="w-2.5 h-2.5" />
+                                measured live
+                              </span>
+                            )}
                             {spec.description}
                           </p>
                         </div>
 
                         <div className="mt-3 pt-2 border-t border-zinc-800/80 text-[10px] text-zinc-400 flex items-center justify-between">
-                          <span>Best for: {spec.recommendedFor}</span>
+                          <span className="truncate">Best for: {spec.recommendedFor}</span>
                           {isSelected && <Check className="w-3.5 h-3.5 text-cyan-400 ml-2 shrink-0" />}
                         </div>
                       </button>

@@ -87,6 +87,9 @@ export default function EdgeNetworkView() {
   const [dnsResult, setDnsResult] = useState<DnsResult | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // real latency history per upstream (for trend chips)
+  const historyRef = useRef<Record<string, number[]>>({});
+  const [historyVersion, setHistoryVersion] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -96,6 +99,15 @@ export default function EdgeNetworkView() {
       if (json.data) {
         setInfo(json.data);
         setError(null);
+        for (const u of json.data.upstreams) {
+          if (u.latencyMs !== null) {
+            const arr = historyRef.current[u.endpoint] ?? [];
+            arr.push(u.latencyMs);
+            if (arr.length > 20) arr.shift();
+            historyRef.current[u.endpoint] = arr;
+          }
+        }
+        setHistoryVersion((v) => v + 1);
       } else {
         setError(json.error ?? 'Failed to load edge status');
       }
@@ -265,29 +277,45 @@ export default function EdgeNetworkView() {
                 </h2>
                 <span className="text-[10px] font-mono text-zinc-500">HEAD probes, re-run every 15s</span>
               </div>
-              <div className="p-4 space-y-2">
-                {info.upstreams.map((u) => (
-                  <div
-                    key={u.endpoint}
-                    className="flex flex-wrap items-center gap-3 rounded-lg border border-zinc-800/70 bg-zinc-950/50 px-3 py-2.5"
-                  >
-                    {u.live ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-none" />
-                    ) : (
-                      <XCircle className="w-4 h-4 text-red-400 flex-none" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs font-mono text-zinc-200 truncate">{u.name}</div>
-                      <div className="text-[10px] font-mono text-zinc-500 truncate">{u.endpoint}</div>
-                    </div>
-                    <div className="text-right flex-none">
-                      <div className={`text-xs font-mono ${u.latencyMs === null ? 'text-red-400' : u.latencyMs < 300 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                        {u.latencyMs === null ? 'unreachable' : `${u.latencyMs} ms`}
+              <div className="p-4 space-y-2" data-history={historyVersion}>
+                {info.upstreams.map((u) => {
+                  const hist = historyRef.current[u.endpoint] ?? [];
+                  const prev = hist.length >= 2 ? hist[hist.length - 2] : null;
+                  const trend = prev !== null && u.latencyMs !== null ? u.latencyMs - prev : 0;
+                  const trendSign = trend > 15 ? '↑' : trend < -15 ? '↓' : '→';
+                  const trendCls = trend > 15 ? 'text-amber-400' : trend < -15 ? 'text-emerald-400' : 'text-zinc-500';
+                  const min = hist.length ? Math.min(...hist) : null;
+                  const max = hist.length ? Math.max(...hist) : null;
+                  return (
+                    <div
+                      key={u.endpoint}
+                      className="flex flex-wrap items-center gap-3 rounded-lg border border-zinc-800/70 bg-zinc-950/50 px-3 py-2.5"
+                    >
+                      {u.live ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-none" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-400 flex-none" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-mono text-zinc-200 truncate">{u.name}</div>
+                        <div className="text-[10px] font-mono text-zinc-500 truncate">{u.endpoint}</div>
                       </div>
-                      <div className="text-[10px] font-mono text-zinc-500">HTTP {u.httpStatus ?? '—'}</div>
+                      {hist.length >= 2 && (
+                        <span className={`text-[11px] font-mono flex-none ${trendCls}`} title="trend vs previous probe">
+                          {trendSign} {Math.abs(trend)}ms
+                        </span>
+                      )}
+                      <div className="text-right flex-none">
+                        <div className={`text-xs font-mono ${u.latencyMs === null ? 'text-red-400' : u.latencyMs < 300 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                          {u.latencyMs === null ? 'unreachable' : `${u.latencyMs} ms`}
+                        </div>
+                        <div className="text-[10px] font-mono text-zinc-500">
+                          {min !== null && max !== null ? `range ${min}–${max}ms · ${hist.length} probes` : `HTTP ${u.httpStatus ?? '—'}`}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 <div className="pt-1 text-[10px] text-zinc-500 font-mono">
                   The provider watchdog re-verifies all upstreams every 30s — status flips are logged to the activity feed.
                 </div>

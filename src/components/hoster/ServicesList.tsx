@@ -221,11 +221,41 @@ export default function ServicesList({
                               ? 'bg-emerald-400 animate-pulse'
                               : srv.status === 'deploying'
                               ? 'bg-amber-400 animate-spin'
+                              : srv.status === 'building'
+                              ? 'bg-cyan-400 animate-pulse'
                               : 'bg-zinc-600'
                           }`}
                         />
                         <span className="text-zinc-300 capitalize">{srv.status}</span>
                       </span>
+
+                      {/* Runtime mode + REAL process identity */}
+                      {srv.status === 'running' && srv.runtime && (
+                        <span
+                          className={`text-[9px] font-mono px-1.5 py-0.5 rounded border flex items-center gap-1 ${
+                            srv.runtime.mode === 'git-deploy'
+                              ? 'bg-cyan-950/70 text-cyan-300 border-cyan-800/60'
+                              : 'bg-violet-950/70 text-violet-300 border-violet-800/60'
+                          }`}
+                          title={
+                            srv.runtime.mode === 'git-deploy'
+                              ? `real git deployment — process pid ${srv.runtime.pid} listening on 127.0.0.1:${srv.runtime.port}`
+                              : 'interactive builtin runner (real in-process HTTP server)'
+                          }
+                        >
+                          {srv.runtime.mode === 'git-deploy' ? (
+                            <>
+                              <GitBranch className="w-2.5 h-2.5" />
+                              pid {srv.runtime.pid}
+                            </>
+                          ) : (
+                            <>
+                              <Server className="w-2.5 h-2.5" />
+                              builtin
+                            </>
+                          )}
+                        </span>
+                      )}
                     </div>
 
                     <p className="text-xs text-zinc-400 line-clamp-1">{srv.description}</p>

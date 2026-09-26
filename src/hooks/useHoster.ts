@@ -136,15 +136,16 @@ export function useHostHistory(points = 80) {
   });
 }
 
-export function useLogs(filter: { scope?: string; serviceId?: string; limit?: number } = {}) {
+export function useLogs(filter: { scope?: string; serviceId?: string; level?: string; limit?: number; refetchMs?: number | false } = {}) {
   const params = new URLSearchParams();
   if (filter.scope) params.set('scope', filter.scope);
   if (filter.serviceId) params.set('serviceId', filter.serviceId);
+  if (filter.level) params.set('level', filter.level);
   params.set('limit', String(filter.limit ?? 80));
   return useQuery({
-    queryKey: ['logs', filter.scope ?? '', filter.serviceId ?? '', filter.limit ?? 80],
+    queryKey: ['logs', filter.scope ?? '', filter.serviceId ?? '', filter.level ?? '', filter.limit ?? 80],
     queryFn: () => api<LogEntry[]>(`/api/logs?${params.toString()}`),
-    refetchInterval: 5000,
+    refetchInterval: filter.refetchMs ?? 5000,
     ...QUERY_OPTS,
   });
 }

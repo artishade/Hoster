@@ -468,7 +468,9 @@ export default function ServiceDetailView({
                 />
               </div>
               <p className="text-[10px] text-zinc-500 font-mono mt-1.5">
-                {spec.vCpu} vCPU dedicated
+                {service.runtime?.mode === 'git-deploy'
+                  ? `measured from /proc/${service.runtime?.pid} — real worker process`
+                  : `${spec.vCpu} vCPU · in-process runner (host CPU chart is authoritative)`}
               </p>
             </div>
 
@@ -479,12 +481,15 @@ export default function ServiceDetailView({
               </div>
               <div className="w-full bg-zinc-800 h-1.5 rounded-full mt-2 overflow-hidden">
                 <div
-                  className="bg-indigo-400 h-full rounded-full transition-all"
+                  className="bg-violet-400 h-full rounded-full transition-all"
                   style={{ width: `${(service.metrics.ramUsedGb / service.metrics.ramTotalGb) * 100}%` }}
                 />
               </div>
               <p className="text-[10px] text-zinc-500 font-mono mt-1.5">
                 {Math.round((service.metrics.ramUsedGb / service.metrics.ramTotalGb) * 100)}% utilized
+                {service.runtime?.mode === 'builtin-runner' && (
+                  <span className="text-zinc-600"> · measured RSS share of the shared control-plane process</span>
+                )}
               </p>
             </div>
 

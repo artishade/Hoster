@@ -13,6 +13,7 @@ import {
   Boxes,
   Settings,
   Network,
+  Radio,
 } from 'lucide-react';
 
 export interface SidebarNavProps {
@@ -93,6 +94,12 @@ export default function SidebarNav({
       label: 'Edge Network',
       icon: Network,
       badge: 'PoP',
+    },
+    {
+      id: 'activity',
+      label: 'Activity & Events',
+      icon: Radio,
+      badge: 'LIVE',
     },
     {
       id: 'mcp-inspector',
