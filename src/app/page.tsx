@@ -17,6 +17,7 @@ import CloudNodesView from '@/components/hoster/CloudNodesView';
 import SettingsView from '@/components/hoster/SettingsView';
 import DeployModal from '@/components/hoster/DeployModal';
 import AiArchitectureAdvisorModal from '@/components/hoster/AiArchitectureAdvisorModal';
+import CommandPalette from '@/components/hoster/CommandPalette';
 
 import {
   useServices,
@@ -102,6 +103,7 @@ export default function HomePage() {
   // ── Modal state ───────────────────────────────────────────────────────────
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
   const [isAdvisorModalOpen, setIsAdvisorModalOpen] = useState(false);
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 
   const handleSelectTab = (tab: string) => {
     // "AI Hardware Sizer" is a modal, not a routed view — opening it must
@@ -112,6 +114,31 @@ export default function HomePage() {
     }
     setCurrentTab(tab);
     setSelectedServiceId(null);
+  };
+
+  // Command palette navigation: view + optional service deep-link.
+  const handlePaletteNavigate = (tab: string, serviceId?: string) => {
+    setCurrentTab(tab);
+    setSelectedServiceId(serviceId ?? null);
+  };
+
+  // Palette service action: stop / restart via the same mutation path as the UI.
+  const handlePaletteServiceAction = async (serviceId: string, action: 'stop' | 'restart') => {
+    const svc = services.find((s) => s.id === serviceId);
+    if (!svc) return;
+    try {
+      await serviceAction.mutateAsync({ id: serviceId, body: { action } });
+      toast.success(action === 'stop' ? `${svc.name} stopping…` : `${svc.name} restarting…`);
+    } catch (err) {
+      toast.error(`Action failed: ${(err as Error).message}`);
+    }
+  };
+
+  // Palette terminal deep-link: navigate to the service's detail view — the
+  // Workspace Shell tab is one click away (tab state lives inside the view).
+  const handlePaletteTerminal = (serviceId: string) => {
+    setCurrentTab('services');
+    setSelectedServiceId(serviceId);
   };
 
   const handleDeployNew = async (payload: Parameters<typeof deployMutation.mutateAsync>[0]) => {
@@ -376,6 +403,7 @@ export default function HomePage() {
         activeView={currentTab}
         onSelectTab={handleSelectTab}
         onOpenMobileNav={() => setMobileNavOpen(true)}
+        onOpenSearch={() => setIsPaletteOpen(true)}
         connectionState={connectionState}
       />
 
@@ -583,6 +611,21 @@ export default function HomePage() {
       <AiArchitectureAdvisorModal
         isOpen={isAdvisorModalOpen}
         onClose={() => setIsAdvisorModalOpen(false)}
+      />
+
+      {/* Global Command Palette (Ctrl/⌘+K) */}
+      <CommandPalette
+        open={isPaletteOpen}
+        onOpenChange={setIsPaletteOpen}
+        services={services}
+        onNavigate={handlePaletteNavigate}
+        onDeployNew={() => setIsDeployModalOpen(true)}
+        onOpenAdvisor={() => setIsAdvisorModalOpen(true)}
+        onServiceAction={handlePaletteServiceAction}
+        onOpenTerminal={handlePaletteTerminal}
+        dbCount={postgresDbs.length + redisDbs.length}
+        volumeCount={volumes.length + s3Buckets.length}
+        domainCount={domains.length}
       />
     </div>
   );

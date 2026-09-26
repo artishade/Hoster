@@ -1,7 +1,9 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
+import { useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import {
   Service, 
   LogEntry, 
   PostgresDatabase, 
@@ -104,6 +106,7 @@ export default function ServiceDetailView({
   onDeleteService,
 }: ServiceDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'terminal' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
+  const queryClient = useQueryClient();
   
   // Hardware Spec
   const spec = HARDWARE_SPECS[service.hardwareTier] || HARDWARE_SPECS['cpu-standard'];
@@ -350,6 +353,65 @@ export default function ServiceDetailView({
 
   const handleSaveHardware = () => {
     onUpdateService({ ...service, hardwareTier: selectedHardwareTier });
+  };
+
+  // ── REAL autoscaling controls (scale actions hit the live control plane) ──
+  const [instancesForm, setInstancesForm] = useState({
+    min: service.instances.min,
+    max: service.instances.max,
+  });
+  const [isSavingInstances, setIsSavingInstances] = useState(false);
+  const [scaleBusy, setScaleBusy] = useState(false);
+
+  const handleScale = async (target: number) => {
+    if (scaleBusy) return;
+    setScaleBusy(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'scale', instances: target }),
+      });
+      const json = (await res.json()) as { data?: typeof service; error?: string };
+      if (!res.ok || !json.data) throw new Error(json.error ?? `scale failed (${res.status})`);
+      // refresh the parent query so the new runtime/workers show up
+      await queryClient.invalidateQueries({ queryKey: ['services'] });
+      toast.success(`${service.name} scaled to ${target} instance${target === 1 ? '' : 's'} — real processes updated`);
+    } catch (err) {
+      toast.error(`Scale failed: ${(err as Error).message}`);
+    } finally {
+      setScaleBusy(false);
+    }
+  };
+
+  const handleInstancesSave = async () => {
+    if (instancesForm.max < instancesForm.min) {
+      toast.error('max must be ≥ min');
+      return;
+    }
+    setIsSavingInstances(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          instances: {
+            min: instancesForm.min,
+            max: instancesForm.max,
+            current: service.instances.current,
+            scaleToZero: service.instances.scaleToZero,
+            scaleToZeroDelaySec: service.instances.scaleToZeroDelaySec,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(`save failed (${res.status})`);
+      await queryClient.invalidateQueries({ queryKey: ['services'] });
+      toast.success(`Autoscaling bounds saved: ${instancesForm.min}–${instancesForm.max}${instancesForm.max > 1 ? ' — policy engine armed' : ''}`);
+    } catch (err) {
+      toast.error(`Save failed: ${(err as Error).message}`);
+    } finally {
+      setIsSavingInstances(false);
+    }
   };
 
   const handleAddCustomDomain = () => {
@@ -1316,6 +1378,116 @@ export default function ServiceDetailView({
               >
                 Apply Hardware Specification
               </button>
+            </div>
+          </div>
+
+          {/* REAL autoscaling — live instances, scale controls, CPU policy */}
+          <div className="p-6 rounded-2xl bg-zinc-900/60 border border-zinc-800 space-y-5">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h3 className="text-sm font-bold text-zinc-100 flex items-center gap-2">
+                  <Sliders className="w-4 h-4 text-emerald-400" />
+                  Autoscaling — Real Processes
+                </h3>
+                <p className="text-xs text-zinc-400 mt-1">
+                  Scale-out spawns additional app processes (own ports, round-robin load balanced through the edge).
+                  The policy engine watches measured CPU from the sampler history.
+                </p>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-1 rounded-full border border-emerald-800/60 bg-emerald-950/30 text-emerald-300 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                policy: avg CPU &gt; 65% → +1 · &lt; 12% → -1 · 3-min cooldown
+              </span>
+            </div>
+
+            {/* live instance table */}
+            <div className="rounded-xl border border-zinc-800 overflow-hidden">
+              <div className="grid grid-cols-[1fr_auto_auto] gap-2 px-4 py-2 bg-zinc-950/80 text-[10px] font-mono uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                <span>instance</span>
+                <span>pid</span>
+                <span className="text-right">port</span>
+              </div>
+              <div className="divide-y divide-zinc-800/60 font-mono text-xs">
+                <div className="grid grid-cols-[1fr_auto_auto] gap-2 px-4 py-2.5 items-center bg-cyan-950/10">
+                  <span className="flex items-center gap-2 text-zinc-100">
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                    primary
+                  </span>
+                  <span className="text-zinc-400">{service.runtime?.pid ?? '—'}</span>
+                  <span className="text-zinc-400 text-right">{service.runtime?.port ?? '—'}</span>
+                </div>
+                {(service.runtime?.workers ?? []).map((w, i) => (
+                  <div key={w.pid} className="grid grid-cols-[1fr_auto_auto] gap-2 px-4 py-2.5 items-center">
+                    <span className="flex items-center gap-2 text-zinc-100">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                      worker {i + 1}
+                    </span>
+                    <span className="text-zinc-400">{w.pid}</span>
+                    <span className="text-zinc-400 text-right">{w.port}</span>
+                  </div>
+                ))}
+                {(service.runtime?.workers ?? []).length === 0 && (
+                  <div className="px-4 py-3 text-[11px] text-zinc-600 font-mono">
+                    single instance — scale out to add real worker processes
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* scale controls */}
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-[11px] font-mono text-zinc-500">
+                {service.instances.current}/{service.instances.max} instances live
+              </span>
+              <div className="flex items-center gap-2 ml-auto">
+                <button
+                  onClick={() => void handleScale(service.instances.current - 1)}
+                  disabled={!service.repoUrl || service.status !== 'running' || service.instances.current <= Math.max(1, service.instances.min)}
+                  className="px-3 py-2 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 text-xs font-mono transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Kill the newest worker (scale in)"
+                >
+                  − scale in
+                </button>
+                <button
+                  onClick={() => void handleScale(service.instances.current + 1)}
+                  disabled={!service.repoUrl || service.status !== 'running' || service.instances.current >= service.instances.max}
+                  className="px-3 py-2 rounded-lg border border-emerald-800/60 bg-emerald-950/40 hover:bg-emerald-900/40 text-emerald-300 text-xs font-mono transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Spawn an additional worker process (scale out)"
+                >
+                  + scale out
+                </button>
+                <button
+                  onClick={() => void handleInstancesSave()}
+                  disabled={isSavingInstances || !service.repoUrl}
+                  className="px-3 py-2 rounded-lg border border-cyan-800/60 bg-cyan-950/40 hover:bg-cyan-900/40 text-cyan-300 text-xs font-mono transition active:scale-95 disabled:opacity-40"
+                  title={`Autoscaling bounds (currently min ${instancesForm.min} / max ${instancesForm.max})`}
+                >
+                  {isSavingInstances ? 'saving…' : `bounds: ${instancesForm.min}–${instancesForm.max} ⤳`}
+                </button>
+              </div>
+            </div>
+
+            {/* min/max editor */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 items-end pt-3 border-t border-zinc-800">
+              <div>
+                <label className="text-[10px] font-mono uppercase text-zinc-500 block mb-1">Min instances</label>
+                <input
+                  type="number" min={1} max={4} value={instancesForm.min}
+                  onChange={(e) => setInstancesForm((f) => ({ ...f, min: Math.max(1, Math.min(4, Number(e.target.value) || 1)) }))}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-mono uppercase text-zinc-500 block mb-1">Max instances</label>
+                <input
+                  type="number" min={1} max={4} value={instancesForm.max}
+                  onChange={(e) => setInstancesForm((f) => ({ ...f, max: Math.max(1, Math.min(4, Number(e.target.value) || 1)) }))}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+              <p className="col-span-2 text-[10px] font-mono text-zinc-600 leading-relaxed">
+                autoscaling is armed for git deployments with max &gt; 1 — the policy sweep runs every 45s against real sampler CPU history
+              </p>
             </div>
           </div>
         </div>

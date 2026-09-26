@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { ensureRuntime } from '@/lib/hoster/runtime';
 import { recordIngressRequest } from '@/lib/hoster/deployer';
+import { pickWorkerPort } from '@/lib/hoster/autoscaler';
 
 /**
  * Same-origin ingress for deployed services.
@@ -60,7 +61,9 @@ async function handle(req: NextRequest, ctx: Ctx): Promise<Response> {
     }
 
     const subPath = (path ?? []).map((seg) => encodeURIComponent(seg)).join('/');
-    const target = new URL(`http://127.0.0.1:${rt.port}/${subPath}`);
+    // Autoscaling: round-robin across primary + live scale-out workers.
+    const targetPort = rt.workers?.length ? pickWorkerPort(row.id, rt.port, rt.workers) : rt.port;
+    const target = new URL(`http://127.0.0.1:${targetPort}/${subPath}`);
     req.nextUrl.searchParams.forEach((value, key) => target.searchParams.append(key, value));
 
     const headers = new Headers();

@@ -26,6 +26,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
+import TerminalSessionsPanel from './TerminalSessionsPanel';
 import { ConnectedProvider, CustomServerNode } from '@/lib/hoster/types';
 
 /* ─── Public contract ───────────────────────────────────────────────────────── */
@@ -600,6 +601,9 @@ export default function SettingsView({
         </div>
       </div>
 
+      {/* ═══ 1.5 WORKSPACE SHELL SESSIONS (live ops view) ═══ */}
+      <TerminalSessionsPanel />
+
       {/* ═══ 2. BUILT-IN FREE PROVIDERS ═══ */}
       <section className="space-y-4">
         <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3">
@@ -635,7 +639,7 @@ export default function SettingsView({
                   {/* Title row */}
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <h4 className="text-sm font-bold text-white truncate">{p.name}</h4>
+                      <h4 className="text-sm font-bold text-white leading-snug break-words" title={p.name}>{p.name}</h4>
                       <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                         <TypeBadge type={p.type} />
                         {(p.isBuiltInFree || p.record?.isBuiltIn) && (
@@ -661,7 +665,7 @@ export default function SettingsView({
                     {p.capacity?.gpuModel ? (
                       <div className="min-w-0">
                         <span className="text-[10px] text-zinc-500 block uppercase">GPU</span>
-                        <span className="text-amber-300 font-bold truncate block" title={p.capacity.gpuModel}>
+                        <span className="text-amber-300 font-bold break-words leading-tight" title={p.capacity.gpuModel}>
                           {p.capacity.gpuModel}
                         </span>
                       </div>

@@ -6,6 +6,7 @@ import { startDeployment, stopDeployment } from '@/lib/hoster/deployer';
 import { addLog, advanceServiceLifecycle, recomputeAllocations, serializeService } from '@/lib/hoster/server';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from '@/lib/hoster/hardware-specs';
 import { generateWebhookSecret, ensureWebhookSecret } from '@/lib/hoster/webhooks';
+import { scaleServiceTo, ensureAutoscaler, liveInstanceCount } from '@/lib/hoster/autoscaler';
 
 export const dynamic = 'force-dynamic';
 
@@ -118,6 +119,35 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         return NextResponse.json({ data: serializeService(fresh, host, { statusOverride: life.status }) });
       }
       return NextResponse.json({ error: 'Service not found after rotation' }, { status: 404 });
+    }
+    if (action === 'scale') {
+      // REAL autoscaling control: set the desired instance count (primary +
+      // workers). Spawns/kills real app processes immediately.
+      ensureAutoscaler();
+      const target = Math.round(Number(body.instances));
+      if (!Number.isFinite(target) || target < 1 || target > 5) {
+        return NextResponse.json({ error: 'instances must be 1..5' }, { status: 400 });
+      }
+      if (!row.repoUrl) {
+        return NextResponse.json({ error: 'builtin runners execute in-process — scaling requires a git deployment' }, { status: 400 });
+      }
+      const count = await scaleServiceTo(row, target);
+      if (count == null) {
+        return NextResponse.json({ error: 'service is not in a scalable state (needs running git-deploy with a persisted boot command — redeploy once)' }, { status: 409 });
+      }
+      await addLog({
+        serviceId: id,
+        scope: 'deploy',
+        message: `Manual scale: "${row.name}" set to ${count} instance(s).`,
+        source: 'orchestrator',
+      });
+      const fresh = await db.service.findUnique({ where: { id } });
+      if (fresh) {
+        const life = await advanceServiceLifecycle(fresh);
+        const host = await getHostMetrics();
+        return NextResponse.json({ data: serializeService(fresh, host, { statusOverride: life.status }) });
+      }
+      return NextResponse.json({ error: 'Service not found after scale' }, { status: 404 });
     }
     if (action === 'stop') {
       data.status = 'stopped';

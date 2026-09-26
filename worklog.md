@@ -170,3 +170,39 @@ Stage Summary:
 - Bugs fixed: unclickable sidebar under sticky header (app-shell), last simulated chart (service history), fake-looking zero metrics on failed services, misleading in-process RAM copy, python PATH reset by login shells, django collectstatic missing, 500-apps never passing readiness.
 - New capabilities: REAL per-service web terminal (PTY through the gateway, with guardrails + activity logging + failed-deploy debugging), python venv isolation with Procfile/django awareness (E2E-verified with a real django+gunicorn app), webhook deliveries in the global activity feed.
 - Recommended next phase: TLS via Caddy for host routing, autoscaling worker from real CPU/RAM history (data now charted), per-service exec (one-shot commands) API on top of the terminal service, terminal session listing/kill in the UI, uv-based installs for faster cold deploys, global search/command palette.
+
+---
+Task ID: review-round-5 (cron webDevReview)
+Agent: main agent (Z.ai Code)
+Task: Assess status, QA via agent-browser, fix bugs, add features (command palette, terminal session manager, REAL autoscaling) + styling polish
+
+Work Log:
+- HEALTH CHECK: all processes alive (dev server PPID-1 daemon, terminal service node --watch), all APIs 200, all deployed apps 200 (real-node-app, browser-e2e-app, mdn-static-demo, py-venv-e2e django), 0 recent dev.log errors, mobile clean.
+- QA via agent-browser across all views + VLM screenshot reviews: zero console/page errors. Investigated VLM-flagged "chart spike" — verified it is REAL data (2 rpm from QA requests; sampler history confirms). No bug.
+- NEW FEATURE — Global Command Palette (Ctrl/⌘+K):
+  * CommandPalette.tsx (cmdk): fuzzy search across services (status dots), all 9 views, quick actions (Deploy, AI Sizer), and per-service actions when a name is typed (open shell, stop, restart). Custom-themed (zinc/cyan, entrance animation), full a11y roles (dialog/combobox/listbox), footer keymap hints.
+  * Navbar gained a Search… button with ⌘K kbd chip; palette wired into page.tsx with navigate/deep-link/action handlers (same mutation paths as the rest of the UI).
+  * E2E VERIFIED through the gateway: Ctrl+K opens (17 items), typing "real-node" filters to the right item, Enter navigates to the service detail view, Esc/backdrop closes. Works on mobile 375px too.
+- NEW FEATURE — Terminal Session Manager (ops view):
+  * terminal-service (port 3031) gained 'list-sessions' (live PTY list with pid/service/age/idle) and 'kill-session' (operator kill) socket events; sessions now carry createdAt.
+  * BUG FIXED during E2E: `sessions.length` on a Map serialized as undefined ("undefined/6 active" chip) — corrected to sessions.size. Also made the panel socket self-healing: on service restart the socket dropped (reconnection: false) and froze stale data — now the 12s poll transparently reconnects, and repeated connect() tears down the previous socket (leak fix).
+  * TerminalSessionsPanel.tsx mounted in Settings view: live pool chip (N/6 active), summary line, session rows with pid/age/idle + near-reaper-limit warning, kill buttons with instant local state feedback, honest empty state.
+  * E2E VERIFIED: attached a terminal in browser tab 2 → appeared in tab 1's panel ("1/6 active", real pid); killed from the panel → tab 2's terminal showed "Shell exited" and the service logged "killed by operator from session manager".
+- NEW FEATURE — REAL autoscaling (process-level, CPU-history driven):
+  * types: ServiceRuntime gains workers[] (RuntimeWorker: pid/port/startedAt) + startCmd (final boot command) + lastScaleAt.
+  * deployer: persists startCmd at deployment success (replayable); stopDeployment kills all scale-out workers; new exports: spawnScaleOutWorker (real bash process, own port via collision-safe allocatePort, env contract identical to primary, app.log fd logging, HTTP readiness probe), killScaleOutWorker, serviceProcessStatsAggregated (sums REAL /proc CPU/RAM across primary + workers). Fixed a TS name collision (WorkersGlobal → ScaleWorkersGlobal).
+  * autoscaler.ts (new): pickWorkerPort (in-memory round-robin across primary + live workers), liveInstanceCount (prunes dead pids), scaleServiceTo (clamped to instances.max and 1+4 hard cap; prunes dead workers first; spawns/kills real processes; persists runtime.workers + instances.current), sweep policy (avg CPU over 5-min MetricSample window, hysteresis 65% up / 12% down, 3-min cooldown, only git-deploys with max>1), ensureAutoscaler lazy interval (45s) started from services GET + scale action.
+  * ingress route: round-robins across primary + workers (pickWorkerPort).
+  * telemetry: service metrics now aggregate /proc stats across all workers.
+  * PATCH action 'scale' { instances: N } on /api/services/[id]: manual control, validates 1..5 + git-deploy, returns fresh serialized row.
+  * UI: Hardware tab gained an "Autoscaling — Real Processes" card — live instance table (primary + workers with pid/port), scale out/in buttons (hit the real API), min/max bounds editor, policy explainer chip. Uses queryClient.invalidateQueries for instant refresh; toast feedback.
+  * E2E VERIFIED end-to-end: redeployed real-node-app (startCmd persisted) → set max=4 → scaled to 3 (2 real worker processes spawned, both directly serving HTTP 200 on their own ports) → 6 ingress requests all 200 across round-robin → scaled back to 1 (both workers reaped). UI test: "+ scale out" click → worker row appeared with live pid, "2/4 instances live" → "− scale in" → worker reaped, "1/4 instances live".
+- Styling polish: Settings built-in provider cards — name + GPU model now break-words instead of hard truncation (VLM feedback), better line-height.
+- INFRA: dev server OOM-killed once during tsc+browser QA — restarted via restart-dev.py double-fork daemon; closed extra browser tabs to reduce memory pressure (known hazard from round 3/4).
+- Verified: eslint clean, tsc clean (app code), all views zero console errors, mobile no-overflow, palette on mobile, ingress 200 for all running services, terminal service reachable through the gateway.
+
+Stage Summary:
+- New capabilities: global command palette (⌘K, real actions + fuzzy search), live terminal session manager (cross-tab list/kill of real PTYs), REAL process-level autoscaling (worker spawn/reap + round-robin ingress + aggregated metrics + CPU-history policy engine + UI controls) — all E2E-verified through the real gateway.
+- Bugs fixed: Map.size vs length serialization in the session manager, stale socket after terminal-service restart, socket leak on panel reconnect.
+- Known risks: scale-out on this 2-vCPU sandbox is bounded (max 4 instances) to avoid OOM; autoscaling requires a redeploy once for startCmd persistence (services deployed before this round report "not scalable" until redeployed — expected, documented in the 409 message).
+- Recommended next phase: TLS via Caddy for host routing, per-service exec API (one-shot commands) on top of the terminal service, uv-based python installs, webhook → autoscale coordination (deploy hooks that scale up before traffic), global delivery log retention policy, service-level spend/cost meter from real instance-hours.

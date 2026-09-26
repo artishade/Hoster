@@ -13,6 +13,7 @@ import {
 } from '@/lib/hoster/server';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from '@/lib/hoster/hardware-specs';
 import { generateWebhookSecret } from '@/lib/hoster/webhooks';
+import { ensureAutoscaler } from '@/lib/hoster/autoscaler';
 import type { Service } from '@/lib/hoster/types';
 
 export const dynamic = 'force-dynamic';
@@ -100,6 +101,7 @@ export async function GET() {
   try {
     ensureHostSampler();
     ensureDeployWatchdog();
+    ensureAutoscaler();
     // Reconcile real runtimes in the background: start missing listeners for
     // running services, stop orphans, refresh health flags.
     void reconcileRuntimes().catch(() => {});

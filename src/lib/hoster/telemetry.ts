@@ -2,7 +2,7 @@ import os from 'os';
 import fsSync from 'fs';
 import type { Service } from './types';
 import { getLiveStateSnapshot } from './runtime';
-import { deployProcessStats } from './deployer';
+import { serviceProcessStatsAggregated } from './deployer';
 import { readProcStats } from './procstats';
 
 /**
@@ -54,9 +54,11 @@ export function computeServiceMetrics(
   let ramUsedGb = 0;
   let ramTotalGb = Math.max(0.25, ramTotalGbForTier);
 
-  const runtime = safeParse<{ pid?: number; mode?: string }>(service.runtimeJson ?? null, {});
+  const runtime = safeParse<{ pid?: number; mode?: string; workers?: unknown }>(service.runtimeJson ?? null, {});
   if (runtime?.mode === 'git-deploy' && typeof runtime.pid === 'number') {
-    const stats = deployProcessStats(service.id) ?? readProcStats(runtime.pid);
+    // aggregated across primary + scale-out workers when autoscaling is active
+    const stats = serviceProcessStatsAggregated(service.id, runtime as import('./types').ServiceRuntime | null)
+      ?? readProcStats(runtime.pid);
     if (stats) {
       cpuPercent = stats.cpuPercent;
       ramUsedGb = stats.ramUsedGb;

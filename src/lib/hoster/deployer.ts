@@ -150,7 +150,7 @@ g.__nxDeployOps = opCounters;
 
 // ─── logging ────────────────────────────────────────────────────────────────
 
-async function dlog(serviceId: string, message: string, level: 'info' | 'warn' | 'error' = 'info'): Promise<void> {
+export async function dlog(serviceId: string, message: string, level: 'info' | 'warn' | 'error' = 'info'): Promise<void> {
   try {
     await db.logEntry.create({
       data: { serviceId, scope: 'deploy', level, message, source: 'git-deployer' },
@@ -693,6 +693,10 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       healthy: true,
       commit: commitHash,
       repoDir,
+      // persist the FINAL (post-transform) boot command so autoscaling can
+      // replay it verbatim for scale-out workers
+      startCmd,
+      workers: [],
     };
     deploys.set(svc.id, { pid, port, startedAt: runtime.startedAt, commit: commitHash, repoDir });
     await db.service.update({
@@ -764,6 +768,11 @@ export async function stopDeployment(svc: { id: string; name: string }): Promise
     killTree(child);
     children.delete(svc.id);
   }
+  // Kill any scale-out workers too (autoscaling) — read the row for the
+  // current worker list before the handle is dropped.
+  const rowForWorkers = await db.service.findUnique({ where: { id: svc.id }, select: { runtimeJson: true } }).catch(() => null);
+  const rtForWorkers = safeParse<ServiceRuntime | null>(rowForWorkers?.runtimeJson ?? null, null);
+  const extraWorkers = rtForWorkers?.workers ?? [];
   const handle = deploys.get(svc.id);
   if (handle) {
     try {
@@ -781,6 +790,10 @@ export async function stopDeployment(svc: { id: string; name: string }): Promise
     deploys.delete(svc.id);
     forgetPid(handle.pid);
     await dlog(svc.id, `Stopped app process tree (pid ${handle.pid}) — port ${handle.port} released.`);
+  }
+  for (const w of extraWorkers) {
+    killTreeByPid(w.pid);
+    await dlog(svc.id, `Stopped scale-out worker (pid ${w.pid}, port ${w.port}) — released.`, 'warn');
   }
   await db.service.update({ where: { id: svc.id }, data: { runtimeJson: null } }).catch(() => {});
 }
@@ -804,6 +817,92 @@ export function deployProcessStats(serviceId: string): { cpuPercent: number; ram
   const workerPid = resolveWorkerPid(handle.pid);
   return readProcStats(workerPid);
 }
+
+// ─── autoscaling: real scale-out workers ──────────────────────────────────
+
+/**
+ * Spawn ONE additional app process for a running git-deploy service — a real
+ * OS process on its own port, booted with the SAME persisted start command,
+ * env vars and workspace as the primary. Returns the worker descriptor.
+ */
+export async function spawnScaleOutWorker(
+  svc: DeployableService,
+  runtime: ServiceRuntime
+): Promise<{ pid: number; port: number; startedAt: string }> {
+  if (!runtime.repoDir || !runtime.startCmd) throw new Error('service has no replayable boot command (pre-autoscaler deploy?)');
+  // fresh port — worker-specific id so it never collides with the primary
+  const port = await allocatePort(`${svc.id}#w${Date.now().toString(36)}`);
+  // same env contract as the primary spawn
+  const envVars = safeParse<{ key: string; value: string }[]>(svc.envVarsJson, []);
+  const childEnv: Record<string, string> = {
+    PORT: String(port),
+    HOST: '127.0.0.1',
+    NODE_ENV: 'production',
+    BUN_ENV: 'production',
+  };
+  for (const v of envVars) childEnv[v.key] = v.value;
+  const logFd = fs.openSync(appLogPath(path.join(DEPLOY_ROOT, svc.name)), 'a');
+  const child = spawn('bash', ['-lc', runtime.startCmd], {
+    cwd: runtime.repoDir,
+    env: { ...process.env, ...childEnv },
+    stdio: ['ignore', logFd, logFd],
+    detached: true,
+  });
+  try {
+    fs.closeSync(logFd);
+  } catch {
+    /* fd dup'ed into the child */
+  }
+  const pid = child.pid ?? -1;
+  const ok = await waitHttpOk(port, BOOT_TIMEOUT_MS, '/');
+  if (!ok) {
+    killTree(child);
+    throw new Error(`scale-out worker (pid ${pid}) did not answer on port ${port} within ${BOOT_TIMEOUT_MS / 1000}s`);
+  }
+  child.on('exit', () => {
+    scaleWorkers.delete(pid);
+  });
+  scaleWorkers.set(pid, child);
+  return { pid, port, startedAt: new Date().toISOString() };
+}
+
+/** Kill one scale-out worker (SIGKILL to its whole tree). */
+export function killScaleOutWorker(pid: number): void {
+  const child = scaleWorkers.get(pid);
+  if (child) {
+    killTree(child);
+    scaleWorkers.delete(pid);
+    return;
+  }
+  killTreeByPid(pid);
+}
+
+/** Aggregate REAL /proc stats across the primary + all scale-out workers. */
+export function serviceProcessStatsAggregated(
+  serviceId: string,
+  runtime: ServiceRuntime | null
+): { cpuPercent: number; ramUsedGb: number; uptimeSec: number } | null {
+  const base = deployProcessStats(serviceId) ?? (runtime?.pid ? readProcStats(resolveWorkerPid(runtime.pid)) : null);
+  const workers = runtime?.workers ?? [];
+  if (workers.length === 0) return base;
+  const parts: { cpuPercent: number; ramUsedGb: number; uptimeSec: number }[] = base ? [base] : [];
+  for (const w of workers) {
+    if (!isPidAlive(w.pid)) continue;
+    const s = readProcStats(resolveWorkerPid(w.pid));
+    if (s) parts.push(s);
+  }
+  if (parts.length === 0) return null;
+  return {
+    cpuPercent: Math.min(100, parts.reduce((a, p) => a + p.cpuPercent, 0)),
+    ramUsedGb: parts.reduce((a, p) => a + p.ramUsedGb, 0),
+    uptimeSec: Math.min(...parts.map((p) => p.uptimeSec)),
+  };
+}
+
+type ScaleWorkersGlobal = typeof globalThis & { __nxScaleWorkers?: Map<number, ChildProcess> };
+const swg = globalThis as ScaleWorkersGlobal;
+const scaleWorkers = swg.__nxScaleWorkers ?? new Map<number, ChildProcess>();
+swg.__nxScaleWorkers = scaleWorkers;
 
 // ─── orphan adoption: re-bind surviving processes after a restart ──────────
 

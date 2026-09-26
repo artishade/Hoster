@@ -112,6 +112,33 @@ function killSession(session, reason) {
 }
 
 io.on('connection', (socket) => {
+  // ── Session manager protocol (ops view): list live PTYs, kill one by id.
+  // Read-only listing + admin kill — no terminal stream attached to this socket.
+  socket.on('list-sessions', (_payload, ack) => {
+    const now = Date.now();
+    const list = [...sessions.values()].map((s) => ({
+      socketId: s.socketId,
+      service: s.service,
+      pid: s.pty.pid,
+      startedAt: s.createdAt,
+      lastActivity: s.lastActivity,
+      idleSec: Math.floor((now - s.lastActivity) / 1000),
+      ageSec: Math.floor((now - s.createdAt) / 1000),
+    }));
+    ack?.({ ok: true, sessions: list, pool: { active: sessions.size, max: MAX_SESSIONS } });
+  });
+
+  socket.on('kill-session', (payload, ack) => {
+    const id = typeof payload?.socketId === 'string' ? payload.socketId : '';
+    const target = sessions.get(id);
+    if (!target) return ack?.({ ok: false, error: 'no such session' });
+    const svc = target.service;
+    const pid = target.pty.pid;
+    killSession(target, `killed by operator from session manager`);
+    platformLog(null, 'warn', `Operator killed terminal session for ${svc} (pty pid ${pid})`);
+    ack?.({ ok: true, killed: id });
+  });
+
   socket.on('attach', async (payload, ack) => {
     const reply = (r) => ack?.(r);
 
@@ -155,6 +182,7 @@ io.on('connection', (socket) => {
       pty,
       service,
       socketId: socket.id,
+      createdAt: Date.now(),
       lastActivity: Date.now(),
       closed: false,
       idleTimer: null,

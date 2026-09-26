@@ -10,6 +10,7 @@ import {
   Sparkles, 
   ShieldCheck, 
   Layers,
+  Search,
   Menu
 } from 'lucide-react';
 
@@ -22,6 +23,8 @@ interface NavbarProps {
   onSelectTab?: (tab: string) => void;
   /** Opens the mobile navigation side panel (< md). */
   onOpenMobileNav?: () => void;
+  /** Opens the global command palette. */
+  onOpenSearch?: () => void;
   /** Live control-plane link state — drives the status pill. */
   connectionState?: ConnectionState;
 }
@@ -32,7 +35,7 @@ const CONNECTION_META: Record<ConnectionState, { label: string; dot: string; tex
   reconnecting: { label: 'Reconnecting', dot: 'bg-amber-400 animate-pulse', text: 'text-amber-300' },
 };
 
-export default function Navbar({ onNewDeploy, onOpenAdvisor, activeView, onSelectTab, onOpenMobileNav, connectionState = 'online' }: NavbarProps) {
+export default function Navbar({ onNewDeploy, onOpenAdvisor, activeView, onSelectTab, onOpenMobileNav, onOpenSearch, connectionState = 'online' }: NavbarProps) {
   const conn = CONNECTION_META[connectionState];
   return (
     <header className="sticky top-0 z-40 w-full border-b border-zinc-800/80 bg-zinc-950/90 backdrop-blur-md px-4 lg:px-8 py-3">
@@ -83,6 +86,18 @@ export default function Navbar({ onNewDeploy, onOpenAdvisor, activeView, onSelec
             <span className={`w-1.5 h-1.5 rounded-full ${conn.dot}`} />
             <span className={`text-[10px] font-mono ${conn.text}`}>{conn.label}</span>
           </div>
+
+          {/* Global search / command palette trigger (Ctrl/⌘+K) */}
+          <button
+            onClick={onOpenSearch}
+            className="flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-zinc-900/70 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-zinc-200 text-xs font-mono transition"
+            title="Search everything (Ctrl/⌘+K)"
+            aria-label="Open command palette"
+          >
+            <Search className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">Search…</span>
+            <kbd className="hidden sm:inline text-[9px] text-zinc-600 border border-zinc-700 rounded px-1 py-0.5">⌘K</kbd>
+          </button>
 
           {/* Org & Project Selector */}
           <div className="hidden md:flex items-center gap-2 pl-4 border-l border-zinc-800 text-xs">

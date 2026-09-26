@@ -230,6 +230,13 @@ export interface EnvVariable {
 }
 
 /** Live state of the real HTTP runner / deployed process serving a service. */
+/** One scale-out worker process (autoscaling) — a REAL app process on its own port. */
+export interface RuntimeWorker {
+  pid: number;
+  port: number;
+  startedAt: string;
+}
+
 export interface ServiceRuntime {
   pid: number;
   port: number;
@@ -240,6 +247,12 @@ export interface ServiceRuntime {
   commit?: string;
   /** Workspace dir of the cloned repo (git-deploy mode). */
   repoDir?: string;
+  /** Scale-out workers beyond the primary (autoscaling) — real pids on real ports. */
+  workers?: RuntimeWorker[];
+  /** The exact (post-transform) boot command — replayed verbatim when scaling out. */
+  startCmd?: string;
+  /** Autoscaler bookkeeping — last decision timestamp (epoch ms). */
+  lastScaleAt?: number;
 }
 
 export interface Service {
