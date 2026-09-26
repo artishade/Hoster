@@ -38,6 +38,7 @@ model Service {
   pluginDetailsJson  String?
   runtimeJson        String?  // live runner state: { pid, port, startedAt, mode, healthy }
   webhookSecret      String?  @unique // HMAC secret for deploy webhooks (GitHub push → redeploy)
+  alertWebhookUrl    String   @default("") // per-service usage-alert fan-out target (http(s), empty = platform default only)
   lifecycleStartedAt DateTime @default(now()) // state machine anchor for building→deploying→running
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

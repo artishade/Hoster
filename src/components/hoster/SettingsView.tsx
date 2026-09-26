@@ -112,7 +112,7 @@ const NODE_STATUS: Record<string, { dot: string; text: string; label: string }> 
 };
 
 const INPUT_CLASS =
-  'w-full min-h-[44px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500';
+  'w-full min-h-[44px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-cyan-500';
 
 function relTime(iso?: string): string {
   if (!iso) return 'never';
@@ -940,7 +940,7 @@ export default function SettingsView({
                 value={formNotes}
                 onChange={(e) => setFormNotes(e.target.value)}
                 placeholder="Anything worth remembering about this provider…"
-                className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500 resize-y"
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2.5 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-cyan-500 resize-y"
               />
             </div>
           </div>

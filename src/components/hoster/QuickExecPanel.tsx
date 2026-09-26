@@ -148,7 +148,7 @@ export default function QuickExecPanel({ service }: { service: Service }) {
               placeholder="run a single command in the workspace…"
               spellCheck={false}
               maxLength={2000}
-              className="w-full bg-zinc-950/70 border border-zinc-800 rounded-lg pl-7 pr-3 py-2 text-xs font-mono text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-700/70 focus:ring-1 focus:ring-cyan-800/40 transition"
+              className="w-full bg-zinc-950/70 border border-zinc-800 rounded-lg pl-7 pr-3 py-2 text-xs font-mono text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-cyan-700/70 focus:ring-1 focus:ring-cyan-800/40 transition"
               aria-label="Command to execute in the service workspace"
             />
           </div>

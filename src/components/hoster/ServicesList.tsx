@@ -151,7 +151,7 @@ export default function ServicesList({
             placeholder="Search by repo, domain, name..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500"
+            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-cyan-500"
           />
         </div>
       </div>
@@ -178,6 +178,8 @@ export default function ServicesList({
             const isGpu = spec.category === 'gpu';
             const isMcp = srv.type === 'mcp';
             const isPlugin = srv.type === 'plugin';
+            // down = no live process (stopped or failed) → metrics block dims
+            const isDown = srv.status !== 'running' && srv.status !== 'deploying' && srv.status !== 'building';
 
             return (
               <div
@@ -305,16 +307,29 @@ export default function ServicesList({
                   {/* Live Metrics Snapshot — stopped/failed services have no
                       live process, so metrics read N/A instead of fake zeros.
                       Top-aligned (lg:items-start) so the block sits at the same
-                      height on every card regardless of description length. */}
-                  <div className="flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border border-zinc-800 text-xs font-mono lg:mt-1">
+                      height on every card regardless of description length.
+                      Down-state styling: the whole block dims (reduced visual
+                      weight per VLM QA) and the value states WHY it's down. */}
+                  <div
+                    className={`flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border text-xs font-mono lg:mt-1 transition-colors ${
+                      isDown ? 'opacity-55 border-zinc-800/60' : 'border-zinc-800'
+                    }`}
+                  >
                     <div>
                       <div className="text-[10px] text-zinc-500 uppercase">CPU / RAM</div>
                       <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
                         {srv.status === 'running' || srv.status === 'deploying' || srv.status === 'building' ? (
                           <>{srv.metrics.cpuPercent}% <span className="text-zinc-600">&bull;</span> {srv.metrics.ramUsedGb}GB</>
                         ) : (
-                          <span className="text-zinc-600" title="No live process — metrics resume when the service runs">
-                            n/a — no process
+                          <span
+                            className={srv.status === 'failed' ? 'text-red-400 text-[11px] font-normal' : 'text-zinc-600 text-[11px] font-normal'}
+                            title={
+                              srv.status === 'failed'
+                                ? 'The process crashed or failed to boot — check the Logs tab for the real stderr tail'
+                                : 'No live process — metrics resume when the service runs'
+                            }
+                          >
+                            {srv.status === 'failed' ? 'process down — see logs' : 'stopped — no process'}
                           </span>
                         )}
                       </div>
@@ -339,8 +354,8 @@ export default function ServicesList({
                         {srv.status === 'running' || srv.status === 'deploying' || srv.status === 'building' ? (
                           <>{srv.metrics.requestsPerMin} <span className="text-zinc-500">rpm</span> <span className="text-zinc-600">&bull;</span> {srv.metrics.latencyP95Ms}ms</>
                         ) : (
-                          <span className="text-zinc-600" title="Ingress counters resume with the process">
-                            n/a — no process
+                          <span className="text-zinc-600 text-[11px] font-normal" title="Ingress counters resume with the process">
+                            no traffic — down
                           </span>
                         )}
                       </div>

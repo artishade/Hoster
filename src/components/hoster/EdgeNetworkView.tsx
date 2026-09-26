@@ -347,7 +347,7 @@ export default function EdgeNetworkView() {
                   onChange={(e) => setDnsDomain(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && void runDnsCheck()}
                   placeholder="your-domain.com"
-                  className="flex-1 px-3.5 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 focus:border-cyan-700 focus:outline-none text-sm font-mono text-zinc-200 placeholder:text-zinc-600 transition"
+                  className="flex-1 px-3.5 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 focus:border-cyan-700 focus:outline-none text-sm font-mono text-zinc-200 placeholder:text-zinc-500 transition"
                   aria-label="Domain to verify"
                 />
                 <button

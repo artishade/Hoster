@@ -40,6 +40,7 @@ import { Server,
   Search,
   Code,
   Webhook,
+  Bell,
   RotateCw,
   FileText,
   History,
@@ -136,6 +137,38 @@ export default function ServiceDetailView({
   const [isRotatingSecret, setIsRotatingSecret] = useState(false);
   const [origin, setOrigin] = useState('');
   useEffect(() => setOrigin(window.location.origin), []);
+
+  // Per-service usage-alert webhook target (fan-out override)
+  const [alertWebhookInput, setAlertWebhookInput] = useState(service.alertWebhookUrl ?? '');
+  const [alertWebhookSaving, setAlertWebhookSaving] = useState(false);
+  useEffect(() => setAlertWebhookInput(service.alertWebhookUrl ?? ''), [service.alertWebhookUrl]);
+
+  const handleSaveAlertWebhook = async () => {
+    const url = alertWebhookInput.trim();
+    if (url && !/^https?:\/\/.+/i.test(url)) {
+      toast.error('Webhook must be an http(s) URL (or empty to clear)');
+      return;
+    }
+    setAlertWebhookSaving(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alertWebhookUrl: url }),
+      });
+      const json = await res.json();
+      if (res.ok && json?.data) {
+        onUpdateService(json.data as Service);
+        toast.success(url ? 'Alert webhook saved — this service now fans out to its own target' : 'Alert webhook cleared — platform-wide target only');
+      } else {
+        toast.error(json?.error || 'Save failed');
+      }
+    } catch (err) {
+      toast.error(`Save failed: ${(err as Error).message}`);
+    } finally {
+      setAlertWebhookSaving(false);
+    }
+  };
 
   const filteredDeliveries =
     deliveryFilter === 'all' ? deliveries : deliveries.filter((d) => d.result === deliveryFilter);
@@ -867,7 +900,7 @@ export default function ServiceDetailView({
                 placeholder="Filter logs by keyword..."
                 value={logSearch}
                 onChange={(e) => setLogSearch(e.target.value)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded px-2.5 py-1 text-xs text-zinc-300 placeholder:text-zinc-600 focus:outline-none"
+                className="w-full bg-zinc-950 border border-zinc-800 rounded px-2.5 py-1 text-xs text-zinc-300 placeholder:text-zinc-500 focus:outline-none"
               />
             </div>
 
@@ -1151,6 +1184,52 @@ export default function ServiceDetailView({
               </div>
               <p className="text-[11px] text-zinc-500">Bearer token auth (<span className="font-mono">Authorization: Bearer &lt;secret&gt;</span>) works too.</p>
             </div>
+          </div>
+
+          {/* Per-service usage-alert webhook target (fan-out to the service owner) */}
+          <div className="p-5 rounded-2xl bg-zinc-900/60 border border-zinc-800 space-y-4">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Bell className="w-4 h-4 text-teal-400" />
+                <h3 className="text-xs font-bold text-zinc-200">Usage alert webhook (this service)</h3>
+              </div>
+              {(service.alertWebhookUrl ?? '') !== '' ? (
+                <span className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md border border-teal-800/60 bg-teal-950/30 text-teal-300">
+                  <span className="w-1.5 h-1.5 rounded-full bg-teal-400" />
+                  armed — alerts fan out to this service&apos;s own target
+                </span>
+              ) : (
+                <span className="text-[11px] font-mono text-zinc-500">platform-wide target only</span>
+              )}
+            </div>
+            <p className="text-[11px] text-zinc-500 leading-relaxed">
+              Usage alerts for <span className="text-zinc-300 font-mono">{service.name}</span> (instance-hour pacing + equivalent-cost thresholds
+              + platform budget lines) are POSTed here as <span className="font-mono text-zinc-400">{'{type: "usage-alert", level, message}'}</span> JSON — in
+              addition to the platform-wide webhook configured in the Usage view. Wire your own Slack/Discord/pager per service.
+            </p>
+            <div className="flex items-center gap-2">
+              <div className="flex-1 min-w-0">
+                <input
+                  type="url"
+                  value={alertWebhookInput}
+                  onChange={(e) => setAlertWebhookInput(e.target.value)}
+                  placeholder="https://hooks.example.com/…  (empty = platform default only)"
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 focus:outline-none focus:border-teal-600/70 focus:ring-1 focus:ring-teal-800/40 transition placeholder:text-zinc-500"
+                  aria-label="Per-service usage alert webhook URL"
+                  spellCheck={false}
+                />
+              </div>
+              <button
+                onClick={() => void handleSaveAlertWebhook()}
+                disabled={alertWebhookSaving}
+                className="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition disabled:opacity-50 shrink-0"
+              >
+                {alertWebhookSaving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+            <p className="text-[10px] text-zinc-600 font-mono">
+              every level (info/warn/error) is delivered — delivery receipts appear in the Activity feed (source: alert-webhook)
+            </p>
           </div>
 
           {/* Delivery history — REAL records */}

@@ -483,7 +483,7 @@ function AlertConfigEditor({ config }: { config?: AlertConfigPayload['config'] }
   };
 
   const inputCls =
-    'w-full px-2.5 py-1.5 rounded-lg bg-zinc-950/70 border border-zinc-800 text-zinc-200 text-xs font-mono focus:outline-none focus:border-cyan-700/70 focus:ring-1 focus:ring-cyan-800/40 transition placeholder:text-zinc-600';
+    'w-full px-2.5 py-1.5 rounded-lg bg-zinc-950/70 border border-zinc-800 text-zinc-200 text-xs font-mono focus:outline-none focus:border-cyan-700/70 focus:ring-1 focus:ring-cyan-800/40 transition placeholder:text-zinc-500';
   const labelCls = 'text-[10px] font-mono uppercase tracking-wider text-zinc-500 mb-1 flex items-center gap-1.5';
 
   return (

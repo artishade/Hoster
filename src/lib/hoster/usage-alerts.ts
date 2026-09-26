@@ -19,9 +19,11 @@ import { getAlertConfig, type AlertConfig } from './alert-config';
  *   - equivalent cost: warn … error (default $0.10 → $0.50 → $2.00)
  *   - platform-wide daily budget: warn / error (default $1.00 / $2.00)
  *
- * Webhook fan-out: alerts at/above the configured minimum level are POSTed
- * (fire-and-forget, 5s timeout) to the operator's webhookUrl; delivery
- * results are recorded as LogEntry rows (source 'alert-webhook').
+ * Webhook fan-out — two independent targets:
+ *   - platform-wide webhookUrl from the alert config (all alerts, level-filtered)
+ *   - per-service Service.alertWebhookUrl (alerts for THAT service only — so a
+ *     service owner can wire their own Slack/pager without seeing anyone
+ *     else's noise). Both respect their own level rules; both record receipts.
  *
  * Dedupe: one row per (day, service, threshold). Fired markers live in
  * memory; after a control-plane restart they are rebuilt by parsing today's
@@ -75,7 +77,8 @@ async function fireAlert(
   serviceId: string | null,
   level: 'info' | 'warn' | 'error',
   message: string,
-  marker: string
+  marker: string,
+  serviceWebhookUrl?: string
 ): Promise<void> {
   state().fired.add(marker);
   try {
@@ -91,19 +94,37 @@ async function fireAlert(
   } catch {
     /* alerting must never break the sampler */
   }
-  // fan-out — never awaited by the sweep, never throws
+  // fan-out — never awaited by the sweep, never throws. Two independent
+  // targets: the platform-wide webhook and this service's own webhook.
   void fanOutAlert(cfg, serviceId, level, message);
+  if (serviceWebhookUrl) {
+    void fanOutAlert(cfg, serviceId, level, message, {
+      url: serviceWebhookUrl,
+      minLevel: 'any', // per-service target opted in explicitly: every alert level
+      target: 'service',
+    });
+  }
 }
 
-/** POST the alert to the operator webhook (if configured & level passes the
- *  filter). Records the delivery result as a LogEntry row. */
-async function fanOutAlert(cfg: AlertConfig, serviceId: string | null, level: 'info' | 'warn' | 'error', message: string): Promise<void> {
-  if (!cfg.webhookUrl) return;
-  if (cfg.webhookMinLevel === 'none') return;
-  if ((LEVEL_RANK[level] ?? 0) < (LEVEL_RANK[cfg.webhookMinLevel] ?? 99)) return;
+/** POST the alert to a webhook target. Records the delivery result as a
+ *  LogEntry row. `override` selects the per-service target instead of the
+ *  platform-wide one ('any' = no level filter — the service owner opted in). */
+async function fanOutAlert(
+  cfg: AlertConfig,
+  serviceId: string | null,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  override?: { url: string; minLevel: 'any' | 'warn' | 'error'; target: 'service' }
+): Promise<void> {
+  const url = override?.url ?? cfg.webhookUrl;
+  const minLevel = override?.minLevel ?? cfg.webhookMinLevel;
+  if (!url) return;
+  if (minLevel === 'none') return; // platform fan-out disabled in config
+  if (minLevel !== 'any' && (LEVEL_RANK[level] ?? 0) < (LEVEL_RANK[minLevel] ?? 99)) return;
 
   const body = JSON.stringify({
     type: 'usage-alert',
+    target: override?.target ?? 'platform',
     level,
     serviceId,
     message,
@@ -111,8 +132,9 @@ async function fanOutAlert(cfg: AlertConfig, serviceId: string | null, level: 'i
   });
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 5000);
+  const urlLabel = url.replace(/^https?:\/\//, '').slice(0, 60);
   try {
-    const res = await fetch(cfg.webhookUrl, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'user-agent': 'nexushost-alerts/1.0' },
       body,
@@ -123,7 +145,7 @@ async function fanOutAlert(cfg: AlertConfig, serviceId: string | null, level: 'i
         serviceId,
         scope: 'usage',
         level: res.ok ? 'info' : 'warn',
-        message: `alert-webhook ▸ delivered ${level} alert → ${res.status} ${res.statusText || ''} (${cfg.webhookUrl.replace(/^https?:\/\//, '').slice(0, 60)})`,
+        message: `alert-webhook ▸ ${override ? 'service target' : 'platform target'} delivered ${level} alert → ${res.status} ${res.statusText || ''} (${urlLabel})`,
         source: 'alert-webhook',
       },
     }).catch(() => undefined);
@@ -133,7 +155,7 @@ async function fanOutAlert(cfg: AlertConfig, serviceId: string | null, level: 'i
         serviceId,
         scope: 'usage',
         level: 'warn',
-        message: `alert-webhook ▸ fan-out failed: ${err instanceof Error ? err.message : String(err)} (${cfg.webhookUrl.replace(/^https?:\/\//, '').slice(0, 60)})`,
+        message: `alert-webhook ▸ ${override ? 'service target' : 'platform target'} fan-out failed: ${err instanceof Error ? err.message : String(err)} (${urlLabel})`,
         source: 'alert-webhook',
       },
     }).catch(() => undefined);
@@ -177,7 +199,7 @@ export async function checkUsageAlerts(): Promise<void> {
   const fired = await rebuildFiredMarkers();
 
   const services = await db.service.findMany({
-    select: { id: true, name: true, hardwareTier: true },
+    select: { id: true, name: true, hardwareTier: true, alertWebhookUrl: true },
   });
   const rows = await db.usageDaily.findMany({
     where: { day },
@@ -204,7 +226,8 @@ export async function checkUsageAlerts(): Promise<void> {
           svc.id,
           'info',
           `usage ▸ "${svc.name}" crossed ${h} instance-hours today (${hours.toFixed(2)}h metered) — pacing signal, equivalent ${fmtUsd(cost)} at list prices, your bill stays $0.00${tag('h', h)}`,
-          `${day}|${svc.id}|hour:${normTh(h)}`
+          `${day}|${svc.id}|hour:${normTh(h)}`,
+          svc.alertWebhookUrl || undefined
         );
       }
     }
@@ -216,7 +239,8 @@ export async function checkUsageAlerts(): Promise<void> {
           svc.id,
           level,
           `usage ▸ "${svc.name}" daily equivalent cost crossed ${fmtUsd(c)} (${fmtUsd(cost)} from ${hours.toFixed(2)} instance-hours) — free tier still bills $0.00, this is the what-you'd-pay-elsewhere meter${tag('c', c)}`,
-          `${day}|${svc.id}|cost:${normTh(c)}`
+          `${day}|${svc.id}|cost:${normTh(c)}`,
+          svc.alertWebhookUrl || undefined
         );
       }
     }

@@ -301,6 +301,8 @@ export interface Service {
   protocol: 'http' | 'sse' | 'stdio-proxy' | 'websocket';
   /** Per-service deploy-webhook secret (HMAC for GitHub push, bearer for generic CI). */
   webhookSecret?: string;
+  /** Per-service usage-alert fan-out target (http(s)); empty = platform-wide webhook only. */
+  alertWebhookUrl: string;
   envVars: EnvVariable[];
   customDomains: string[];
   attachedPostgresId?: string;

@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch index.mjs",
-    "start": "node index.mjs"
+    "dev": "node --watch --watch-path=./src src/index.mjs",
+    "start": "node src/index.mjs"
   },
   "dependencies": {
     "node-pty": "^1.0.0",

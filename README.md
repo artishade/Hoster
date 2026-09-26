@@ -55,9 +55,10 @@ The platform was deliberately rebuilt around one rule: *if it can't be measured,
 | **Autoscaling** | Process-level scale-out | Real worker processes spawned/killed on their own ports, round-robin ingress across primary + workers, aggregated `/proc` metrics, CPU-history-driven policy (65 % up / 12 % down hysteresis over a 5-min window, 3-min cooldown, hard cap 1+4 instances). |
 | **Webhooks** | Push-to-deploy | GitHub-compatible receiver with timing-safe HMAC-SHA256 signature verification (`x-hub-signature-256`), repo-URL normalization (protocol/`.git`/auth-insensitive), branch filters, in-progress guards, plus a generic token-authenticated endpoint for GitLab/Gitea/cron. Full delivery history. Opt-in **webhook→autoscale coordination**: a per-service toggle scales the service to its configured max as soon as a webhook redeploy is running (pre-traffic warm-up). |
 | **Usage metering** | Instance-hours, requests, egress | 15 s sampler flushes real instance-seconds × live instance count (including scale-out workers), per-request counts, and content-length-measured egress into daily `UsageDaily` rows. Equivalent-cost view at public list-price ballpark — the platform itself bills $0.00. |
-| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery results logged) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. |
+| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery results logged) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. Each service can additionally carry its **own alert webhook target** so a service owner receives only their own alerts. |
 | **Cost projection** | 30-day outlook | Projects current footprint and configured autoscaler max over 720 h with live burn-rate, from real instance counts. |
-| **Activity feed** | Global real event stream | Deploys, watchdog transitions, DNS checks, DB ops, webhook deliveries, exec runs, terminal sessions, usage alerts — scope chips, level filters, live search, pause/resume, smart app-log budgets so failures always stream. |
+| **Activity feed** | Global real event stream | Deploys, watchdog transitions, DNS checks, DB ops, webhook deliveries, exec runs, terminal sessions, usage alerts — scope chips, level filters, live search, pause/resume, smart app-log budgets so failures always stream. Includes an editable **data-retention policy** with live DB-growth stats and real pruning. |
+| **Data retention** | Bounded DB growth | Operator-editable retention policy (log rows / webhook-delivery days, auto-prune interval, on/off toggle) persisted in the DB with env fallbacks. The 15 s sampler runs real `DELETE` passes; every prune that deletes rows writes a receipt into the very feed it governs. The Activity view shows live stats: row counts, oldest-row age, real growth/day, DB file size, next auto-prune countdown. |
 | **Databases & storage** | SQL + Redis consoles, volumes, buckets | Real SQL console queries, real Redis `SET`/`GET` round-trips with real keyspace/memory measurements, volumes as real on-disk directories with usage measured by walking the filesystem. |
 | **Command palette** | `Ctrl/⌘ + K` | Fuzzy search across services, all views, and quick actions (deploy, open shell, stop, restart) with per-service actions — plus a **live terminal pool**: every open PTY session on the host with one-keystroke operator kill. |
 | **MCP inspector & agent API** | `/api/mcp/execute`, `/api/agent/*` | Programmatic control of the platform, plus an AI architecture advisor modal in the UI. |
@@ -254,8 +255,12 @@ Real process-level autoscaling:
 | `DATABASE_URL` | — | SQLite file URL (required) |
 | `NX_USAGE_ALERT_HOUR_THRESHOLDS` | `2,6,12` | Instance-hour alert ladder — **fallback** when no DB config row exists (edit in the Usage view instead) |
 | `NX_USAGE_ALERT_COST_THRESHOLDS` | `0.1,0.5,2.0` | Equivalent-cost alert ladder in $ — fallback, same as above |
+| `NX_RETENTION_LOG_DAYS` | `7` | LogEntry retention days — **fallback** when no DB config row exists (edit in the Activity view instead) |
+| `NX_RETENTION_WEBHOOK_DAYS` | `30` | WebhookDelivery retention days — fallback, same as above |
+| `NX_RETENTION_PRUNE_INTERVAL_MIN` | `10` | Minutes between auto-prune passes — fallback, same as above |
+| `NX_RETENTION_AUTO_PRUNE` | `1` | `0`/`false` disables automatic pruning — fallback, same as above |
 
-Alert/budget configuration priority: **database row** (edited via the Usage view's configure panel, persisted as a `PlatformSetting`) → **environment variables** → **built-in defaults**.
+Alert/budget configuration priority: **database row** (edited via the Usage view's configure panel, persisted as a `PlatformSetting`) → **environment variables** → **built-in defaults**. The same priority applies to the data-retention policy (edited via the Activity view's retention card).
 
 Free-tier hardware specs are **measured from the actual host** at runtime (vCPU count, memory), so the tier catalogue reflects the machine you run on. The `/api/hardware-specs` endpoint serves the measured numbers and the UI displays them with "measured live" badges.
 
@@ -283,6 +288,7 @@ Free-tier hardware specs are **measured from the actual host** at runtime (vCPU 
 | `GET` | `/api/logs` | Activity feed (scope/level filters) |
 | `GET` | `/api/usage` | Usage totals, per-service metering, cost projection |
 | `GET`/`PUT`/`DELETE` | `/api/settings/alerts` | Alert/budget configuration (ladders, budgets, webhook fan-out) — persisted, validated |
+| `GET`/`PUT`/`DELETE`/`POST` | `/api/settings/retention` | Data-retention policy + live DB growth stats; `POST` = prune now (real deletes) |
 | `GET` | `/api/hardware-specs` | Measured tier catalogue + host info |
 | `GET` | `/api/system/metrics`, `/api/system/history`, `/api/system/realtime-node` | Host telemetry |
 | `POST` | `/api/mcp/execute` | MCP tool execution |
@@ -356,7 +362,7 @@ Every capability above has been verified end-to-end on a live machine, including
 - **Usage history starts at first metering** — no backfill, by design (honesty over pretty charts).
 - **Python ML repos**: `torch`-class dependency trees are heavy without a shared cache; `uv` mitigates, venv-per-service isolation is intentional.
 - **Scale-out caps**: bounded (1+4 workers) to protect small hosts from OOM; the cap is a one-line constant.
-- Roadmap: TLS via Caddy at the edge, webhook → autoscale coordination (pre-traffic scale-up), operator-configurable budget thresholds in the DB (currently env vars), webhook fan-out on error-level usage alerts, uv-everywhere cold-deploy caching.
+- Roadmap: TLS via Caddy at the edge, per-service retention overrides, alert fan-out retry with backoff, uv-everywhere cold-deploy caching. Shipped in earlier rounds: webhook→autoscale coordination, DB-persisted budget thresholds, alert webhook fan-out (platform + per-service targets), data-retention policy with real pruning.
 
 ## License
 

@@ -19,6 +19,7 @@ interface PatchBody {
   instances?: unknown;
   hardwareTier?: unknown;
   customDomains?: unknown;
+  alertWebhookUrl?: unknown;
 }
 
 function str(v: unknown, fallback = ''): string {
@@ -102,6 +103,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       instancesJson?: string;
       hardwareTier?: string;
       customDomainsJson?: string;
+      alertWebhookUrl?: string;
     } = {};
 
     const action = typeof body.action === 'string' ? body.action : undefined;
@@ -187,6 +189,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         Array.isArray(body.customDomains) ? body.customDomains.map((d) => String(d).trim().toLowerCase()).filter(Boolean).slice(0, 20) : []
       );
     }
+    if (body.alertWebhookUrl !== undefined) {
+      const url = typeof body.alertWebhookUrl === 'string' ? body.alertWebhookUrl.trim() : '';
+      if (url && !/^https?:\/\/.+/i.test(url)) {
+        return NextResponse.json({ error: 'alertWebhookUrl must be an http(s) URL (or empty to clear)' }, { status: 400 });
+      }
+      if (url.length > 500) {
+        return NextResponse.json({ error: 'alertWebhookUrl too long (max 500 chars)' }, { status: 400 });
+      }
+      data.alertWebhookUrl = url;
+    }
 
     const updated =
       Object.keys(data).length > 0 && action !== 'stop' && action !== 'start' && action !== 'restart'
@@ -227,6 +239,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     }
     if (body.customDomains !== undefined) {
       await addLog({ serviceId: id, scope: 'service', message: `Custom domains updated for "${row.name}"` });
+    }
+    if (body.alertWebhookUrl !== undefined && data.alertWebhookUrl !== undefined && data.alertWebhookUrl !== (row.alertWebhookUrl ?? '')) {
+      await addLog({
+        serviceId: id,
+        scope: 'service',
+        message: data.alertWebhookUrl
+          ? `Usage-alert webhook target set for "${row.name}" — this service's alerts fan out to its own endpoint in addition to the platform webhook.`
+          : `Usage-alert webhook target cleared for "${row.name}" — alerts fall back to the platform-wide webhook only.`,
+        source: 'settings',
+      });
     }
     if (action) {
       void recomputeAllocations().catch(() => {});

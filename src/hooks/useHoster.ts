@@ -218,6 +218,84 @@ export function useResetAlertConfig() {
   });
 }
 
+// ─── Data retention policy (log + webhook-delivery pruning) ─────────────────
+
+export interface RetentionStats {
+  logEntryCount: number;
+  webhookDeliveryCount: number;
+  oldestLogAt: string | null;
+  newestLogAt: string | null;
+  rowsLast24h: number;
+  estRowsPerDay: number;
+  dbFileMb: number;
+  lastPrune: { at: string; logsPruned: number; deliveriesPruned: number } | null;
+  nextAutoPruneInMs: number | null;
+}
+
+export interface RetentionConfigPayload {
+  config: {
+    logRetentionDays: number;
+    webhookDeliveryRetentionDays: number;
+    autoPrune: boolean;
+    pruneIntervalMin: number;
+  };
+  source: 'db' | 'env' | 'default';
+  defaults?: RetentionConfigPayload['config'];
+  stats?: RetentionStats;
+}
+
+export function useRetentionConfig() {
+  return useQuery({
+    queryKey: ['retention-config'],
+    queryFn: () => api<RetentionConfigPayload>('/api/settings/retention'),
+    ...QUERY_OPTS,
+    staleTime: 10000,
+  });
+}
+
+export function useSaveRetentionConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: RetentionConfigPayload['config']) =>
+      api<RetentionConfigPayload>('/api/settings/retention', { method: 'PUT', body: JSON.stringify(payload) }),
+    onSuccess: (data) => {
+      void qc.invalidateQueries({ queryKey: ['retention-config'] });
+      qc.setQueryData(['retention-config'], (old: RetentionConfigPayload | undefined) =>
+        old ? { ...old, config: data.config, source: data.source } : data
+      );
+    },
+  });
+}
+
+export function useResetRetentionConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<RetentionConfigPayload>('/api/settings/retention', { method: 'DELETE' }),
+    onSuccess: (data) => {
+      qc.setQueryData(['retention-config'], data);
+      void qc.invalidateQueries({ queryKey: ['retention-config'] });
+    },
+  });
+}
+
+/** Manual prune-now (real deletes; receipt lands in the Activity feed). */
+export function usePruneNow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api<{ result: { logsPruned: number; deliveriesPruned: number; ms: number }; stats: RetentionStats }>(
+        '/api/settings/retention',
+        { method: 'POST' }
+      ),
+    onSuccess: (data) => {
+      qc.setQueryData(['retention-config'], (old: RetentionConfigPayload | undefined) =>
+        old ? { ...old, stats: data.stats } : old
+      );
+      void qc.invalidateQueries({ queryKey: ['logs'] });
+    },
+  });
+}
+
 export function useDeployService() {
   const qc = useQueryClient();
   return useMutation({

@@ -114,7 +114,7 @@ const METHOD_LABELS: Record<string, string> = {
 };
 
 const INPUT_CLASS =
-  'w-full min-h-[44px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500';
+  'w-full min-h-[44px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-cyan-500';
 
 function relTime(iso?: string | null): string {
   if (!iso) return 'never';

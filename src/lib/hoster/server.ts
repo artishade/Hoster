@@ -8,6 +8,7 @@ import { ensureRuntime, getLiveStateSnapshot } from './runtime';
 import { deployProcessStats, getDeployHandle } from './deployer';
 import { flushServiceUsage } from './usage';
 import { checkUsageAlerts } from './usage-alerts';
+import { maybePrune } from './retention';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from './hardware-specs';
 import type {
   Service,
@@ -30,6 +31,7 @@ type PrismaService = {
   protocol: string; envVarsJson: string; customDomainsJson: string; attachedPostgresId: string | null;
   attachedRedisId: string | null; volumeMountsJson: string; s3BucketId: string | null; mcpDetailsJson: string | null;
   pluginDetailsJson: string | null; runtimeJson?: string | null; webhookSecret?: string | null;
+  alertWebhookUrl?: string | null;
   lifecycleStartedAt: Date; createdAt: Date; updatedAt: Date;
 };
 
@@ -163,6 +165,7 @@ export function serializeService(
     port: row.port,
     protocol: row.protocol as Service['protocol'],
     webhookSecret: row.webhookSecret ?? undefined,
+    alertWebhookUrl: row.alertWebhookUrl ?? '',
     envVars: safeParse(row.envVarsJson, []),
     customDomains: safeParse(row.customDomainsJson, []),
     attachedPostgresId: row.attachedPostgresId ?? undefined,
@@ -439,6 +442,12 @@ export async function recordHostSample(): Promise<void> {
       await checkUsageAlerts();
     } catch {
       /* alerting must never break the sampler */
+    }
+    // ── retention auto-prune (self-throttled per configured interval) ──
+    try {
+      await maybePrune();
+    } catch {
+      /* retention must never break the sampler */
     }
     // trim service samples
     const svcCount = await db.metricSample.count({ where: { scope: 'service' } });
