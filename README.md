@@ -55,7 +55,7 @@ The platform was deliberately rebuilt around one rule: *if it can't be measured,
 | **Autoscaling** | Process-level scale-out | Real worker processes spawned/killed on their own ports, round-robin ingress across primary + workers, aggregated `/proc` metrics, CPU-history-driven policy (65 % up / 12 % down hysteresis over a 5-min window, 3-min cooldown, hard cap 1+4 instances). |
 | **Webhooks** | Push-to-deploy | GitHub-compatible receiver with timing-safe HMAC-SHA256 signature verification (`x-hub-signature-256`), repo-URL normalization (protocol/`.git`/auth-insensitive), branch filters, in-progress guards, plus a generic token-authenticated endpoint for GitLab/Gitea/cron. Full delivery history. |
 | **Usage metering** | Instance-hours, requests, egress | 15 s sampler flushes real instance-seconds × live instance count (including scale-out workers), per-request counts, and content-length-measured egress into daily `UsageDaily` rows. Equivalent-cost view at public list-price ballpark — the platform itself bills $0.00. |
-| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe, all env-tunable. |
+| **Budget alerts** | Threshold ladders on real spend | Instance-hour ladders (2/6/12 h), per-service equivalent-cost ladders ($0.10/$0.50/$2.00), platform daily budget ($1 warn / $2 error) — restart-safe dedupe. Ladders, budgets, and an alert **webhook fan-out** (POST on warn/error alerts, 5 s timeout, delivery results logged) are operator-editable in the UI and persisted in the DB (`PlatformSetting`), with env-var and default fallbacks. |
 | **Cost projection** | 30-day outlook | Projects current footprint and configured autoscaler max over 720 h with live burn-rate, from real instance counts. |
 | **Activity feed** | Global real event stream | Deploys, watchdog transitions, DNS checks, DB ops, webhook deliveries, exec runs, terminal sessions, usage alerts — scope chips, level filters, live search, pause/resume, smart app-log budgets so failures always stream. |
 | **Databases & storage** | SQL + Redis consoles, volumes, buckets | Real SQL console queries, real Redis `SET`/`GET` round-trips with real keyspace/memory measurements, volumes as real on-disk directories with usage measured by walking the filesystem. |
@@ -238,7 +238,7 @@ Real process-level autoscaling:
 
 - A 15 s sampler accumulates **real instance-seconds** (live instance count × time, workers included), **request counts**, and **egress bytes** (content-length measured at the ingress) into daily per-service rows.
 - The Usage & Spend view shows daily instance-hours and request charts, per-service tables, and an **equivalent-cost** view (what this footprint would cost at $0.008/vCPU-hr + $0.004/GB-RAM-hr public list prices — the platform itself bills $0.00, and the UI says so).
-- Budget alerts fire as threshold ladders are crossed (instance-hours, per-service cost, platform daily budget), deduplicated across restarts, tunable via environment variables.
+- Budget alerts fire as threshold ladders are crossed (instance-hours, per-service cost, platform daily budget), deduplicated across restarts — configurable in the Usage view (persisted to the database) or via environment variables, with an optional webhook fan-out endpoint that receives every warn/error alert as a JSON POST.
 - A 30-day cost projection card compares current footprint vs configured autoscaler max, with today's live burn-rate.
 
 ![Usage](docs/screenshots/usage.png)
@@ -250,8 +250,10 @@ Real process-level autoscaling:
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | — | SQLite file URL (required) |
-| `NX_USAGE_ALERT_HOUR_THRESHOLDS` | `2,6,12` | Instance-hour alert ladder (comma-separated) |
-| `NX_USAGE_ALERT_COST_THRESHOLDS` | `0.1,0.5,2.0` | Equivalent-cost alert ladder in $ (comma-separated) |
+| `NX_USAGE_ALERT_HOUR_THRESHOLDS` | `2,6,12` | Instance-hour alert ladder — **fallback** when no DB config row exists (edit in the Usage view instead) |
+| `NX_USAGE_ALERT_COST_THRESHOLDS` | `0.1,0.5,2.0` | Equivalent-cost alert ladder in $ — fallback, same as above |
+
+Alert/budget configuration priority: **database row** (edited via the Usage view's configure panel, persisted as a `PlatformSetting`) → **environment variables** → **built-in defaults**.
 
 Free-tier hardware specs are **measured from the actual host** at runtime (vCPU count, memory), so the tier catalogue reflects the machine you run on. The `/api/hardware-specs` endpoint serves the measured numbers and the UI displays them with "measured live" badges.
 
@@ -278,6 +280,7 @@ Free-tier hardware specs are **measured from the actual host** at runtime (vCPU 
 | `GET`/`PATCH` | `/api/providers`, `/api/providers/<id>` | Providers (token-safe serialization) |
 | `GET` | `/api/logs` | Activity feed (scope/level filters) |
 | `GET` | `/api/usage` | Usage totals, per-service metering, cost projection |
+| `GET`/`PUT`/`DELETE` | `/api/settings/alerts` | Alert/budget configuration (ladders, budgets, webhook fan-out) — persisted, validated |
 | `GET` | `/api/hardware-specs` | Measured tier catalogue + host info |
 | `GET` | `/api/system/metrics`, `/api/system/history`, `/api/system/realtime-node` | Host telemetry |
 | `POST` | `/api/mcp/execute` | MCP tool execution |

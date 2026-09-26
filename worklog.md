@@ -295,3 +295,37 @@ Stage Summary:
 - Security: provider tokens / webhook secrets / runtime DB removed from git tracking permanently; .env untracked in favor of .env.example.
 - Terminal-service relaunched (double-fork daemon, PPID 1); all platform surfaces healthy again.
 - Recommended next phase: continue the round-7 backlog (TLS via Caddy on a real host, webhook→autoscale coordination, budget thresholds persisted in DB with UI, alert webhook fan-out); also consider a GitHub Action or script to keep the repo in sync with sandbox state (this was the first manual publish — the remote previously held a stale simulated-era snapshot with unrelated history).
+
+---
+Task ID: review-round-9 (cron webDevReview)
+Agent: main agent (Z.ai Code)
+Task: Assess status, QA via agent-browser, fix bugs, implement DB-persisted budget/alert config + UI + webhook fan-out (round-7 #3 recommendation + alert fan-out), styling polish
+
+Work Log:
+- HEALTH CHECK: dev server 200, terminal service (3031) alive (restarted in round 8), 5/6 services running (nova failed = real), all ingress 200 with -L (308s are Next's known trailing-slash redirect), single next-dev process, EADDRINUSE in dev.log = historical (past restart attempt).
+- QA via agent-browser across ALL views (dashboard, edge, activity, usage, databases, storage, domains, providers, settings, service detail × 4 tabs) + mobile 375px (set viewport syntax: `agent-browser set viewport <w> <h>`): zero console errors, no horizontal overflow. VLM screenshot review flagged 3 candidates; DOM-measured 2 as false alarms (navbar text fits, no clipping) and confirmed 1 REAL defect: service-detail action row wrapped "Live Endpoint" onto a second line, left-aligned (flex-wrap row 373px wide). FIXED: row now `md:justify-end gap-y-2` — wrapped buttons right-align under the others. VLM re-review: FIXED.
+- NEW FEATURE — DB-persisted alert/budget configuration + webhook fan-out (the round-7 #3 recommendation, plus "alert notifications beyond the feed"):
+  * Prisma PlatformSetting model (key/valueJson) added + db:push. KNOWN ISSUE hit again: the running dev server had the OLD Prisma client cached (PUT failed 500 on platformSetting.upsert) — fixed with the standard full-tree restart via restart-dev.py (documented round-6 procedure; this is now the expected step after any db:push).
+  * src/lib/hoster/alert-config.ts (new): AlertConfig type (hourThresholds, costThresholds, budgetWarnUsd, budgetErrorUsd, webhookUrl, webhookMinLevel), full input validation (positive numbers, 1-6 per ladder, warn<error, http(s) webhook, level enum), priority DB row > NX_USAGE_ALERT_* env > defaults, 15s read cache, save/reset helpers that invalidate it.
+  * usage-alerts.ts refactored: sweep reads the effective config each run (no more module-level consts); fireAlert fans out via void fanOutAlert (fire-and-forget, 5s AbortController timeout, level-rank filter) — POSTs {type:'usage-alert', level, serviceId, message, timestamp}; every delivery/failure recorded as a LogEntry (source 'alert-webhook', scope 'usage') so results appear in the Activity feed. The sweep itself can never block or throw on fan-out.
+  * /api/settings/alerts (new): GET effective config + source + defaults; PUT validate+upsert (422 with reasons); DELETE row → env/default fallback. Route follows the { data } API convention.
+  * useHoster.ts: useAlertConfig + useSaveAlertConfig/useResetAlertConfig (setQueryData + invalidate on success).
+  * UsageView: threshold ladder line now DYNAMIC from the effective config; config-source chip (custom config / env config / defaults with tooltips); "configure" toggle expands the new AlertConfigEditor — 6 fields (hour ladder, cost ladder, budget warn/error, webhook URL, min-level select), save/reset buttons with pending states + sonner toasts, inline server-error display, methodology footer. Form sync via keyed remount (key=JSON.stringify(config)) — no setState-in-effect (lint rule enforced this pattern).
+  * ActivityFeedView: 'alert-webhook' source label + maps to the usage scope in both the filter and row scope derivations.
+  * README updated: feature table (budget alerts row), API reference (+/api/settings/alerts), usage guide, config section now documents the DB > env > default priority.
+- E2E VERIFIED (curl + DB + real webhook listener):
+  * GET → defaults, source 'default'. 3 validation rejections fire correctly (ftp:// URL, warn≥error, non-numeric ladder).
+  * Saved cost ladder [0.001] + webhook + minLevel 'error' → sweep fired the platform budget WARN (correctly did NOT fan out — below error min level).
+  * FIRST fan-out attempt appeared to fail — root cause: MY TEST picked 0.001, a threshold round-7's env test had already fired today; the restart-safe dedupe (per day/service/threshold) correctly suppressed refires. With a fresh 0.002 ladder: 5 error alerts fired → 5 REAL webhook deliveries received by the listener (JSON with real metered numbers) + 5 "delivered 200 OK" LogEntry rows.
+  * Failure path: webhook → dead port → 5 "fan-out failed: fetch failed" warn rows; sweep unaffected.
+  * DELETE → source 'default', 0 PlatformSetting rows. Defaults produce no further alerts (all markers exist / below thresholds).
+  * UI (agent-browser): editor opens (6 fields render with effective values), save round-trip → API shows source 'db' + new values, dynamic ladder updated ("1h · 3h · 6h · 12h"), chip "custom config", UI reset → source 'default'. NOTE for future rounds: element refs go stale when the keyed editor remounts after save — re-find/click via fresh snapshot (cost one confusing miss).
+  * Mobile 375px: editor visible, no horizontal overflow, 0 console errors. VLM review of desktop + mobile editor screenshots: PASS both.
+- Styling: action-row fix (above) + the new editor surfaces follow the established design language (mono labels, zinc palette, cyan accents, focus rings, tabular-nums).
+- Final regression: all 8 views swept, 0 console errors; tsc clean (src); eslint clean.
+
+Stage Summary:
+- Bugs fixed: service-detail action-row wrap misalignment (the one real QA finding).
+- New capability: usage alerting graduated from env-tuned to a first-class operator feature — DB-persisted threshold ladders/budgets + webhook fan-out with delivery receipts, editable from the dashboard, E2E-verified end-to-end including the dedupe interplay, level filtering, and failure path.
+- Known risks: after any prisma db:push the dev server MUST be fully restarted (stale client — recurred this round); test alert rows from this round remain in today's activity feed (real events, honest); the fan-out fetch has no retry (by design — receipts make failures visible).
+- Recommended next phase: webhook→autoscale coordination (pre-traffic scale-up hooks), terminal sessions in the command palette, TLS via Caddy on a real host, delivery-log retention policy, per-service (not just platform-wide) webhook targets.

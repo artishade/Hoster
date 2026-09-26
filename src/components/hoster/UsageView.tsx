@@ -17,7 +17,8 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { useUsage } from '@/hooks/useHoster';
+import { useUsage, useAlertConfig, useSaveAlertConfig, useResetAlertConfig, type AlertConfigPayload } from '@/hooks/useHoster';
+import { toast } from 'sonner';
 import {
   Receipt,
   Clock3,
@@ -34,6 +35,11 @@ import {
   AlertTriangle,
   XCircle,
   CheckCircle2,
+  Settings2,
+  Save,
+  RotateCcw,
+  Send,
+  ChevronDown,
 } from 'lucide-react';
 
 const STATUS_DOT: Record<string, string> = {
@@ -85,6 +91,7 @@ export default function UsageView() {
   const [days, setDays] = useState(30);
   const usageQ = useUsage(days);
   const report = usageQ.data;
+  const alertCfgQ = useAlertConfig();
 
   // REAL usage alert rows (scope 'usage' — written by the usage-meter)
   const [alerts, setAlerts] = useState<AlertRow[]>([]);
@@ -199,7 +206,12 @@ export default function UsageView() {
           </div>
 
           {/* Usage alerts — REAL LogEntry rows from the usage-meter */}
-          <UsageAlertsCard alerts={alerts} todayRunRate={report.today} />
+          <UsageAlertsCard
+            alerts={alerts}
+            todayRunRate={report.today}
+            config={alertCfgQ.data?.config}
+            configSource={alertCfgQ.data?.source}
+          />
 
           {/* 30-day chart */}
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
@@ -302,12 +314,21 @@ export default function UsageView() {
 function UsageAlertsCard({
   alerts,
   todayRunRate,
+  config,
+  configSource,
 }: {
   alerts: AlertRow[];
   todayRunRate: { day: string; equivalentUsd: number; hoursElapsed: number; runRateUsdPerDay: number };
+  config?: AlertConfigPayload['config'];
+  configSource?: 'db' | 'env' | 'default';
 }) {
   const todayAlerts = alerts.filter((a) => (a.timestamp ?? '').slice(0, 10) === todayRunRate.day);
   const warnCount = todayAlerts.filter((a) => a.level === 'warn' || a.level === 'error').length;
+  const [editing, setEditing] = useState(false);
+
+  const hours = config?.hourThresholds ?? [2, 6, 12];
+  const costs = config?.costThresholds ?? [0.1, 0.5, 2.0];
+  const budgetWarn = config?.budgetWarnUsd ?? 1.0;
 
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
@@ -325,24 +346,63 @@ function UsageAlertsCard({
             </span>
           )}
         </h3>
-        <span className="text-[10px] font-mono text-zinc-600">real LogEntry rows from the usage-meter · 10s poll</span>
+        <div className="flex items-center gap-2">
+          {configSource && (
+            <span
+              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${
+                configSource === 'db'
+                  ? 'bg-cyan-950/50 border-cyan-800/60 text-cyan-300'
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-500'
+              }`}
+              title={
+                configSource === 'db'
+                  ? 'operator config persisted in the database'
+                  : configSource === 'env'
+                    ? 'NX_USAGE_ALERT_* environment variables (no DB row)'
+                    : 'built-in defaults (no DB row, no env)'
+              }
+            >
+              {configSource === 'db' ? 'custom config' : configSource === 'env' ? 'env config' : 'defaults'}
+            </span>
+          )}
+          <button
+            onClick={() => setEditing((v) => !v)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-mono transition ${
+              editing
+                ? 'bg-cyan-950/60 border-cyan-800/60 text-cyan-300'
+                : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
+            }`}
+            aria-expanded={editing}
+          >
+            <Settings2 className="w-3.5 h-3.5" />
+            configure
+            <ChevronDown className={`w-3 h-3 transition-transform ${editing ? 'rotate-180' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      {/* threshold ladder */}
+      {/* threshold ladder — live from the effective config */}
       <div className="px-4 py-2.5 border-b border-zinc-800/60 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] font-mono text-zinc-500">
         <span className="flex items-center gap-1.5">
           <Gauge className="w-3 h-3 text-teal-400" />
-          instance-hours: <span className="text-zinc-300">2h · 6h · 12h</span> /day
+          instance-hours: <span className="text-zinc-300">{hours.map((h) => `${h}h`).join(' · ')}</span> /day
         </span>
         <span className="flex items-center gap-1.5">
           <Wallet className="w-3 h-3 text-amber-400" />
-          equiv. cost: <span className="text-zinc-300">$0.10 · $0.50 · $2.00</span> /day
+          equiv. cost: <span className="text-zinc-300">{costs.map((c) => fmtUsd(c)).join(' · ')}</span> /day
         </span>
         <span className="flex items-center gap-1.5">
           <Scale className="w-3 h-3 text-rose-400" />
-          platform budget: <span className="text-zinc-300">$1.00</span> /day
+          platform budget: <span className="text-zinc-300">{fmtUsd(budgetWarn)}</span> /day
         </span>
       </div>
+
+      {editing && (
+        <AlertConfigEditor
+          key={JSON.stringify(config)}
+          config={config}
+        />
+      )}
 
       {todayAlerts.length === 0 ? (
         <div className="px-4 py-5 flex items-start gap-2.5">
@@ -379,6 +439,174 @@ function UsageAlertsCard({
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── alert/budget configuration editor (DB-persisted operator config) ────────
+
+function AlertConfigEditor({ config }: { config?: AlertConfigPayload['config'] }) {
+  const save = useSaveAlertConfig();
+  const reset = useResetAlertConfig();
+
+  const [hoursText, setHoursText] = useState((config?.hourThresholds ?? [2, 6, 12]).join(', '));
+  const [costsText, setCostsText] = useState((config?.costThresholds ?? [0.1, 0.5, 2.0]).join(', '));
+  const [budgetWarn, setBudgetWarn] = useState(String(config?.budgetWarnUsd ?? 1));
+  const [budgetError, setBudgetError] = useState(String(config?.budgetErrorUsd ?? 2));
+  const [webhookUrl, setWebhookUrl] = useState(config?.webhookUrl ?? '');
+  const [minLevel, setMinLevel] = useState<'none' | 'warn' | 'error'>(config?.webhookMinLevel ?? 'none');
+
+  // remount-on-config-change (key at the call site) keeps the form in sync
+  // after save/reset without setState-in-effect
+
+  const buildPayload = (): AlertConfigPayload['config'] => ({
+    hourThresholds: hoursText.split(',').map((s) => Number(s.trim())),
+    costThresholds: costsText.split(',').map((s) => Number(s.trim())),
+    budgetWarnUsd: Number(budgetWarn),
+    budgetErrorUsd: Number(budgetError),
+    webhookUrl,
+    webhookMinLevel: minLevel,
+  });
+
+  const handleSave = () => {
+    save.mutate(buildPayload(), {
+      onSuccess: () => toast.success('Alert config saved — applied on the next sweep (≤60s)'),
+      onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+    });
+  };
+
+  const handleReset = () => {
+    reset.mutate(undefined, {
+      onSuccess: () => toast.success('Alert config reset — env/defaults take over'),
+      onError: (err: Error) => toast.error(`Reset failed: ${err.message}`),
+    });
+  };
+
+  const inputCls =
+    'w-full px-2.5 py-1.5 rounded-lg bg-zinc-950/70 border border-zinc-800 text-zinc-200 text-xs font-mono focus:outline-none focus:border-cyan-700/70 focus:ring-1 focus:ring-cyan-800/40 transition placeholder:text-zinc-600';
+  const labelCls = 'text-[10px] font-mono uppercase tracking-wider text-zinc-500 mb-1 flex items-center gap-1.5';
+
+  return (
+    <div className="px-4 py-4 border-b border-zinc-800/60 bg-zinc-950/40 space-y-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+        <div>
+          <label className={labelCls} htmlFor="alert-hours">
+            <Gauge className="w-3 h-3 text-teal-400" /> instance-hour ladder
+          </label>
+          <input
+            id="alert-hours"
+            className={inputCls}
+            value={hoursText}
+            onChange={(e) => setHoursText(e.target.value)}
+            placeholder="2, 6, 12"
+            spellCheck={false}
+          />
+          <p className="text-[9px] text-zinc-600 font-mono mt-1">comma-separated hours · info pacing signals · max 6</p>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="alert-costs">
+            <Wallet className="w-3 h-3 text-amber-400" /> equivalent-cost ladder
+          </label>
+          <input
+            id="alert-costs"
+            className={inputCls}
+            value={costsText}
+            onChange={(e) => setCostsText(e.target.value)}
+            placeholder="0.10, 0.50, 2.00"
+            spellCheck={false}
+          />
+          <p className="text-[9px] text-zinc-600 font-mono mt-1">USD per service/day · highest step fires error</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3.5">
+          <div>
+            <label className={labelCls} htmlFor="alert-budget-warn">
+              <AlertTriangle className="w-3 h-3 text-amber-400" /> budget warn
+            </label>
+            <input
+              id="alert-budget-warn"
+              className={inputCls}
+              value={budgetWarn}
+              onChange={(e) => setBudgetWarn(e.target.value)}
+              inputMode="decimal"
+            />
+            <p className="text-[9px] text-zinc-600 font-mono mt-1">platform $ /day</p>
+          </div>
+          <div>
+            <label className={labelCls} htmlFor="alert-budget-error">
+              <XCircle className="w-3 h-3 text-red-400" /> budget error
+            </label>
+            <input
+              id="alert-budget-error"
+              className={inputCls}
+              value={budgetError}
+              onChange={(e) => setBudgetError(e.target.value)}
+              inputMode="decimal"
+            />
+            <p className="text-[9px] text-zinc-600 font-mono mt-1">must exceed warn</p>
+          </div>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="alert-webhook-url">
+            <Send className="w-3 h-3 text-cyan-400" /> alert webhook (fan-out)
+          </label>
+          <input
+            id="alert-webhook-url"
+            className={inputCls}
+            value={webhookUrl}
+            onChange={(e) => setWebhookUrl(e.target.value)}
+            placeholder="https://hooks.example.com/alerts (empty = disabled)"
+            spellCheck={false}
+          />
+          <p className="text-[9px] text-zinc-600 font-mono mt-1">POST {`{ type: 'usage-alert', level, message }`} · 5s timeout</p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2">
+          <label className={labelCls + ' mb-0'} htmlFor="alert-min-level">
+            fan out from level
+          </label>
+          <select
+            id="alert-min-level"
+            value={minLevel}
+            onChange={(e) => setMinLevel(e.target.value as 'none' | 'warn' | 'error')}
+            className="px-2 py-1.5 rounded-lg bg-zinc-950/70 border border-zinc-800 text-zinc-200 text-xs font-mono focus:outline-none focus:border-cyan-700/70 transition"
+          >
+            <option value="none">disabled</option>
+            <option value="warn">warn + error</option>
+            <option value="error">error only</option>
+          </select>
+        </div>
+
+        <div className="flex items-center gap-2 ml-auto">
+          <button
+            onClick={handleReset}
+            disabled={reset.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 text-xs font-mono transition disabled:opacity-50"
+            title="Remove the DB row — env/defaults take over"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            {reset.isPending ? 'resetting…' : 'reset'}
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={save.isPending}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition disabled:opacity-50"
+          >
+            {save.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            {save.isPending ? 'saving…' : 'save config'}
+          </button>
+        </div>
+      </div>
+
+      {save.isError && (
+        <p className="text-[10px] font-mono text-red-400 break-words">{(save.error as Error).message}</p>
+      )}
+      <p className="text-[9px] text-zinc-600 font-mono leading-relaxed">
+        persisted as a <code className="text-cyan-300/80">PlatformSetting</code> row → live on the next alert sweep
+        (≤60s) · one alert per threshold per service per UTC day · fan-out delivery results appear in the Activity feed
+        (source <span className="text-zinc-400">alert-webhook</span>)
+      </p>
     </div>
   );
 }

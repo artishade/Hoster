@@ -92,6 +92,7 @@ const sourceLabels: Record<string, string> = {
   exec: 'exec',
   'webhook-receiver': 'webhook',
   'usage-meter': 'usage-meter',
+  'alert-webhook': 'alert-webhook',
 };
 
 export default function ActivityFeedView() {
@@ -150,7 +151,7 @@ export default function ActivityFeedView() {
       const s = l.source ?? 'nexus-platform';
       if (s === 'git-deployer' || s === 'build-runner' || s === 'orchestrator') return 'deploy';
       if (s === 'webhook-receiver') return 'webhooks';
-      if (s === 'usage-meter') return 'usage';
+      if (s === 'usage-meter' || s === 'alert-webhook') return 'usage';
       if (s === 'watchdog' || s === 'node-agent' || s === 'settings') return 'provider';
       if (s === 'app' || s === 'service-runner' || s === 'terminal-service' || s === 'exec') return 'service';
       if (s === 'db-provisioner' || s === 'sql-console') return 'database';
@@ -314,6 +315,7 @@ export default function ActivityFeedView() {
               const s = l.source ?? 'nexus-platform';
               if (s === 'git-deployer' || s === 'build-runner' || s === 'orchestrator') return 'deploy';
               if (s === 'webhook-receiver') return 'webhooks';
+              if (s === 'usage-meter' || s === 'alert-webhook') return 'usage';
               if (s === 'watchdog' || s === 'node-agent' || s === 'settings') return 'provider';
               if (s === 'app' || s === 'service-runner' || s === 'terminal-service') return 'service';
               if (s === 'db-provisioner' || s === 'sql-console') return 'database';

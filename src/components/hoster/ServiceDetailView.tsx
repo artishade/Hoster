@@ -540,7 +540,7 @@ export default function ServiceDetailView({
         </div>
 
         {/* Quick External Actions */}
-        <div className="flex items-center gap-2.5 flex-wrap">
+        <div className="flex items-center gap-2.5 gap-y-2 flex-wrap md:justify-end">
           {onToggleServiceStatus && (
             <button
               onClick={() => void onToggleServiceStatus(service.id)}

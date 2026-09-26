@@ -219,6 +219,17 @@ model UsageDaily {
   @@index([day])
 }
 
+// ─── Platform settings (operator config persisted in DB) ─────────────────────
+// Generic key/value store for control-plane configuration that operators
+// edit at runtime (e.g. the usage-alert budget ladders + webhook fan-out).
+// Readers cache briefly; writers invalidate through the lib helpers.
+
+model PlatformSetting {
+  key       String   @id
+  valueJson String
+  updatedAt DateTime @updatedAt
+}
+
 // ─── Metrics history (host + services) ───────────────────────────────────────
 
 model MetricSample {

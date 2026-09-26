@@ -161,6 +161,29 @@ export function useLogs(filter: { scope?: string; serviceId?: string; level?: st
   });
 }
 
+/** Operator alert/budget configuration (DB-persisted, env fallback). */
+export interface AlertConfigPayload {
+  config: {
+    hourThresholds: number[];
+    costThresholds: number[];
+    budgetWarnUsd: number;
+    budgetErrorUsd: number;
+    webhookUrl: string;
+    webhookMinLevel: 'none' | 'warn' | 'error';
+  };
+  source: 'db' | 'env' | 'default';
+  defaults?: AlertConfigPayload['config'];
+}
+
+export function useAlertConfig() {
+  return useQuery({
+    queryKey: ['alert-config'],
+    queryFn: () => api<AlertConfigPayload>('/api/settings/alerts'),
+    ...QUERY_OPTS,
+    staleTime: 10000,
+  });
+}
+
 // ─── Mutations ───────────────────────────────────────────────────────────────
 
 function useInvalidate() {
@@ -168,6 +191,31 @@ function useInvalidate() {
   return (...keys: string[]) => {
     for (const key of keys) void qc.invalidateQueries({ queryKey: [key] });
   };
+}
+
+/** Save the operator alert/budget config (PUT) — server validates. */
+export function useSaveAlertConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: AlertConfigPayload['config']) =>
+      api<AlertConfigPayload>('/api/settings/alerts', { method: 'PUT', body: JSON.stringify(payload) }),
+    onSuccess: (data) => {
+      qc.setQueryData(['alert-config'], data);
+      void qc.invalidateQueries({ queryKey: ['alert-config'] });
+    },
+  });
+}
+
+/** Reset to env/defaults (DELETE the DB row). */
+export function useResetAlertConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<AlertConfigPayload>('/api/settings/alerts', { method: 'DELETE' }),
+    onSuccess: (data) => {
+      qc.setQueryData(['alert-config'], data);
+      void qc.invalidateQueries({ queryKey: ['alert-config'] });
+    },
+  });
 }
 
 export function useDeployService() {

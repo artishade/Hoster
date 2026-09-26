@@ -1,5 +1,6 @@
 import { db } from '@/lib/db';
 import { tierRatePerHourUsd } from './usage';
+import { getAlertConfig, type AlertConfig } from './alert-config';
 
 /**
  * REAL usage-based alerts — budget warnings in the Activity feed.
@@ -9,10 +10,18 @@ import { tierRatePerHourUsd } from './usage';
  * fired alert is a real LogEntry (scope 'usage', source 'usage-meter'), so
  * alerts appear in the global Activity feed and /api/logs?scope=usage.
  *
+ * Threshold ladders / budgets / webhook fan-out are operator-configurable:
+ * DB row (PlatformSetting 'usage-alerts', edited in the Usage view) →
+ * env (NX_USAGE_ALERT_*) → defaults. See alert-config.ts.
+ *
  * Ladders (per service, per UTC day):
- *   - instance-hours: 2h → info, 6h → info, 12h → info  (pacing signals)
- *   - equivalent cost: $0.10 → warn, $0.50 → warn, $2.00 → error (runaway)
- *   - platform-wide daily budget: $1.00 → warn, $2.00 → error
+ *   - instance-hours: info pacing signals (default 2h → 6h → 12h)
+ *   - equivalent cost: warn … error (default $0.10 → $0.50 → $2.00)
+ *   - platform-wide daily budget: warn / error (default $1.00 / $2.00)
+ *
+ * Webhook fan-out: alerts at/above the configured minimum level are POSTed
+ * (fire-and-forget, 5s timeout) to the operator's webhookUrl; delivery
+ * results are recorded as LogEntry rows (source 'alert-webhook').
  *
  * Dedupe: one row per (day, service, threshold). Fired markers live in
  * memory; after a control-plane restart they are rebuilt by parsing today's
@@ -21,24 +30,6 @@ import { tierRatePerHourUsd } from './usage';
  */
 
 const CHECK_MIN_INTERVAL_MS = 60_000;
-
-/** Threshold ladders — env-overridable so operators can tune their alerting
- *  (comma-separated numbers): NX_USAGE_ALERT_HOUR_THRESHOLDS, NX_USAGE_ALERT_COST_THRESHOLDS. */
-function parseEnvNums(name: string, defaults: readonly number[]): number[] {
-  const raw = process.env[name];
-  if (!raw) return [...defaults];
-  const parsed = raw
-    .split(',')
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0)
-    .sort((a, b) => a - b);
-  return parsed.length ? parsed.slice(0, 6) : [...defaults];
-}
-
-export const HOUR_THRESHOLDS = parseEnvNums('NX_USAGE_ALERT_HOUR_THRESHOLDS', [2, 6, 12]);
-export const COST_THRESHOLDS = parseEnvNums('NX_USAGE_ALERT_COST_THRESHOLDS', [0.1, 0.5, 2.0]);
-export const GLOBAL_BUDGET_USD = 1.0;
-export const GLOBAL_BUDGET_ERROR_USD = 2.0;
 
 interface UsageAlertGlobal {
   __nxUsageAlertState?: {
@@ -77,7 +68,15 @@ function tag(kind: 'h' | 'c' | 'b', v: number): string {
   return ` [${kind}:${normTh(v)}]`;
 }
 
-async function fireAlert(serviceId: string | null, level: 'info' | 'warn' | 'error', message: string, marker: string): Promise<void> {
+const LEVEL_RANK: Record<string, number> = { info: 0, warn: 1, error: 2 };
+
+async function fireAlert(
+  cfg: AlertConfig,
+  serviceId: string | null,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  marker: string
+): Promise<void> {
   state().fired.add(marker);
   try {
     await db.logEntry.create({
@@ -91,6 +90,55 @@ async function fireAlert(serviceId: string | null, level: 'info' | 'warn' | 'err
     });
   } catch {
     /* alerting must never break the sampler */
+  }
+  // fan-out — never awaited by the sweep, never throws
+  void fanOutAlert(cfg, serviceId, level, message);
+}
+
+/** POST the alert to the operator webhook (if configured & level passes the
+ *  filter). Records the delivery result as a LogEntry row. */
+async function fanOutAlert(cfg: AlertConfig, serviceId: string | null, level: 'info' | 'warn' | 'error', message: string): Promise<void> {
+  if (!cfg.webhookUrl) return;
+  if (cfg.webhookMinLevel === 'none') return;
+  if ((LEVEL_RANK[level] ?? 0) < (LEVEL_RANK[cfg.webhookMinLevel] ?? 99)) return;
+
+  const body = JSON.stringify({
+    type: 'usage-alert',
+    level,
+    serviceId,
+    message,
+    timestamp: new Date().toISOString(),
+  });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 5000);
+  try {
+    const res = await fetch(cfg.webhookUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'nexushost-alerts/1.0' },
+      body,
+      signal: ctl.signal,
+    });
+    await db.logEntry.create({
+      data: {
+        serviceId,
+        scope: 'usage',
+        level: res.ok ? 'info' : 'warn',
+        message: `alert-webhook ▸ delivered ${level} alert → ${res.status} ${res.statusText || ''} (${cfg.webhookUrl.replace(/^https?:\/\//, '').slice(0, 60)})`,
+        source: 'alert-webhook',
+      },
+    }).catch(() => undefined);
+  } catch (err) {
+    await db.logEntry.create({
+      data: {
+        serviceId,
+        scope: 'usage',
+        level: 'warn',
+        message: `alert-webhook ▸ fan-out failed: ${err instanceof Error ? err.message : String(err)} (${cfg.webhookUrl.replace(/^https?:\/\//, '').slice(0, 60)})`,
+        source: 'alert-webhook',
+      },
+    }).catch(() => undefined);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -124,6 +172,7 @@ export async function checkUsageAlerts(): Promise<void> {
   if (now - st.lastCheckAt < CHECK_MIN_INTERVAL_MS) return;
   st.lastCheckAt = now;
 
+  const { config: cfg } = await getAlertConfig();
   const day = todayKey();
   const fired = await rebuildFiredMarkers();
 
@@ -148,9 +197,10 @@ export async function checkUsageAlerts(): Promise<void> {
     globalCostToday += cost;
     costBy.set(svc.id, cost);
 
-    for (const h of HOUR_THRESHOLDS) {
+    for (const h of cfg.hourThresholds) {
       if (hours >= h && !fired.has(`${day}|${svc.id}|hour:${normTh(h)}`)) {
         await fireAlert(
+          cfg,
           svc.id,
           'info',
           `usage ▸ "${svc.name}" crossed ${h} instance-hours today (${hours.toFixed(2)}h metered) — pacing signal, equivalent ${fmtUsd(cost)} at list prices, your bill stays $0.00${tag('h', h)}`,
@@ -158,10 +208,11 @@ export async function checkUsageAlerts(): Promise<void> {
         );
       }
     }
-    for (const c of COST_THRESHOLDS) {
+    for (const c of cfg.costThresholds) {
       if (cost >= c && !fired.has(`${day}|${svc.id}|cost:${normTh(c)}`)) {
-        const level = c >= COST_THRESHOLDS[COST_THRESHOLDS.length - 1] ? 'error' : 'warn';
+        const level = c >= cfg.costThresholds[cfg.costThresholds.length - 1] ? 'error' : 'warn';
         await fireAlert(
+          cfg,
           svc.id,
           level,
           `usage ▸ "${svc.name}" daily equivalent cost crossed ${fmtUsd(c)} (${fmtUsd(cost)} from ${hours.toFixed(2)} instance-hours) — free tier still bills $0.00, this is the what-you'd-pay-elsewhere meter${tag('c', c)}`,
@@ -172,20 +223,22 @@ export async function checkUsageAlerts(): Promise<void> {
   }
 
   // ── platform-wide budget ───────────────────────────────────────────────
-  if (globalCostToday >= GLOBAL_BUDGET_USD && !fired.has(`${day}|platform|budget:${normTh(GLOBAL_BUDGET_USD)}`)) {
+  if (globalCostToday >= cfg.budgetWarnUsd && !fired.has(`${day}|platform|budget:${normTh(cfg.budgetWarnUsd)}`)) {
     await fireAlert(
+      cfg,
       null,
       'warn',
-      `usage ▸ platform-wide daily equivalent crossed ${fmtUsd(GLOBAL_BUDGET_USD)} (${fmtUsd(globalCostToday)} across ${services.length} services) — heaviest: ${heaviest(costBy, services)}${tag('b', GLOBAL_BUDGET_USD)}`,
-      `${day}|platform|budget:${normTh(GLOBAL_BUDGET_USD)}`
+      `usage ▸ platform-wide daily equivalent crossed ${fmtUsd(cfg.budgetWarnUsd)} (${fmtUsd(globalCostToday)} across ${services.length} services) — heaviest: ${heaviest(costBy, services)}${tag('b', cfg.budgetWarnUsd)}`,
+      `${day}|platform|budget:${normTh(cfg.budgetWarnUsd)}`
     );
   }
-  if (globalCostToday >= GLOBAL_BUDGET_ERROR_USD && !fired.has(`${day}|platform|budget:${normTh(GLOBAL_BUDGET_ERROR_USD)}`)) {
+  if (globalCostToday >= cfg.budgetErrorUsd && !fired.has(`${day}|platform|budget:${normTh(cfg.budgetErrorUsd)}`)) {
     await fireAlert(
+      cfg,
       null,
       'error',
-      `usage ▸ platform-wide daily equivalent crossed ${fmtUsd(GLOBAL_BUDGET_ERROR_USD)} (${fmtUsd(globalCostToday)}) — runaway workload territory; consider scale-in or stopping idle services${tag('b', GLOBAL_BUDGET_ERROR_USD)}`,
-      `${day}|platform|budget:${normTh(GLOBAL_BUDGET_ERROR_USD)}`
+      `usage ▸ platform-wide daily equivalent crossed ${fmtUsd(cfg.budgetErrorUsd)} (${fmtUsd(globalCostToday)}) — runaway workload territory; consider scale-in or stopping idle services${tag('b', cfg.budgetErrorUsd)}`,
+      `${day}|platform|budget:${normTh(cfg.budgetErrorUsd)}`
     );
   }
 }
