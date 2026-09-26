@@ -1,0 +1,1054 @@
+     1→import http from 'node:http';
+     2→import net from 'node:net';
+     3→import crypto from 'node:crypto';
+     4→import { db } from '@/lib/db';
+     5→import type { ServiceRuntime } from './types';
+     6→
+     7→/**
+     8→ * Real service runtime.
+     9→ *
+    10→ * Every service in "running" state gets a REAL HTTP server bound to a real
+    11→ * 127.0.0.1 port inside the control-plane host. Requests reach it through the
+    12→ * same-origin ingress proxy (/api/ingress/<name>) so deployed projects are
+    13→ * actually visitable AND interactive — no DNS records required.
+    14→ *
+    15→ * Each runner serves:
+    16→ *   - a live interactive console at / (API playground, persistent KV data
+    17→ *     store, real-time request feed, SSE stream for streaming services)
+    18→ *   - real JSON endpoints: /health, /api/meta, /api/stats, /api/time,
+    19→ *     /api/echo, /api/kv[/:key], /api/requests, /sse
+    20→ *   - genuine persistent state (SQLite-backed ServiceData KV store) and
+    21→ *     genuine request metrics that survive restarts
+    22→ *
+    23→ * The pretty hostname (https://<name>.nexushost.dev) remains the "custom
+    24→ * domain" view: it only resolves once a wildcard DNS record points at this
+    25→ * server, exactly like any real platform. The UI marks it as DNS-pending.
+    26→ */
+    27→
+    28→// Survives dev-server hot reloads via globalThis.
+    29→type RunnerGlobal = typeof globalThis & {
+    30→  __serviceRunners?: Map<string, http.Server>;
+    31→  __serviceLiveStates?: Map<string, LiveState>;
+    32→};
+    33→const g = globalThis as RunnerGlobal;
+    34→const runners = g.__serviceRunners ?? new Map<string, http.Server>();
+    35→g.__serviceRunners = runners;
+    36→
+    37→const PORT_BASE = 42100;
+    38→const PORT_RANGE = 900;
+    39→const MAX_PORT_TRIES = 40;
+    40→const HEALTH_TIMEOUT_MS = 900;
+    41→
+    42→/** Bump when the runner app changes so hot-reloaded servers get replaced. */
+    43→const RUNNER_VERSION = 5;
+    44→
+    45→const RING_CAP = 50;
+    46→const LATENCY_CAP = 200;
+    47→const STATS_KEY = '__stats';
+    48→const MAX_KEY_LEN = 120;
+    49→const MAX_VALUE_BYTES = 64 * 1024;
+    50→
+    51→type PathStat = { count: number; totalMs: number };
+    52→
+    53→interface LiveState {
+    54→  stats: {
+    55→    totalRequests: number;
+    56→    okResponses: number;
+    57→    errorResponses: number;
+    58→    totalMs: number;
+    59→    byPath: Record<string, PathStat>;
+    60→    lastRequestAt: string | null;
+    61→  };
+    62→  ring: { method: string; path: string; status: number; ms: number; at: string }[];
+    63→  latencies: number[];
+    64→  flushTimer: NodeJS.Timeout | null;
+    65→}
+    66→
+    67→type RuntimeState = ServiceRuntime;
+    68→
+    69→// ─── small local helpers (runtime.ts must not import server.ts → no cycles) ──
+    70→
+    71→function safeParse<T>(json: string | null | undefined, fallback: T): T {
+    72→  if (!json) return fallback;
+    73→  try {
+    74→    return JSON.parse(json) as T;
+    75→  } catch {
+    76→    return fallback;
+    77→  }
+    78→}
+    79→
+    80→async function writeLog(serviceId: string | null, message: string, source = 'service-runner'): Promise<void> {
+    81→  try {
+    82→    await db.logEntry.create({ data: { serviceId, scope: 'service', level: 'info', message, source } });
+    83→  } catch {
+    84→    /* logging must never break the runtime */
+    85→  }
+    86→}
+    87→
+    88→// ─── networking helpers ──────────────────────────────────────────────────────
+    89→
+    90→function isPortFree(port: number): Promise<boolean> {
+    91→  return new Promise((resolve) => {
+    92→    const probe = net.createServer();
+    93→    probe.once('error', () => resolve(false));
+    94→    probe.once('listening', () => probe.close(() => resolve(true)));
+    95→    probe.listen(port, '127.0.0.1');
+    96→  });
+    97→}
+    98→
+    99→function portForService(id: string): number {
+   100→  const hash = crypto.createHash('sha1').update(id).digest();
+   101→  return PORT_BASE + (hash.readUInt16BE(0) % PORT_RANGE);
+   102→}
+   103→
+   104→async function allocatePort(id: string): Promise<number> {
+   105→  const preferred = portForService(id);
+   106→  for (let i = 0; i < MAX_PORT_TRIES; i++) {
+   107→    const candidate = PORT_BASE + (((preferred - PORT_BASE + i) % PORT_RANGE) + PORT_RANGE) % PORT_RANGE;
+   108→    if (await isPortFree(candidate)) return candidate;
+   109→  }
+   110→  return preferred; // let listen() surface the error if truly exhausted
+   111→}
+   112→
+   113→export async function isHealthy(port: number): Promise<boolean> {
+   114→  try {
+   115→    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+   116→      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+   117→      cache: 'no-store',
+   118→    });
+   119→    return res.ok;
+   120→  } catch {
+   121→    return false;
+   122→  }
+   123→}
+   124→
+   125→// ─── per-service live metrics (real request tracking) ────────────────────────
+   126→
+   127→const liveStates = g.__serviceLiveStates ?? new Map<string, LiveState>();
+   128→g.__serviceLiveStates = liveStates;
+   129→
+   130→function emptyStats(): LiveState['stats'] {
+   131→  return { totalRequests: 0, okResponses: 0, errorResponses: 0, totalMs: 0, byPath: {}, lastRequestAt: null };
+   132→}
+   133→
+   134→function getLiveState(serviceId: string): LiveState {
+   135→  let st = liveStates.get(serviceId);
+   136→  if (!st) {
+   137→    st = { stats: emptyStats(), ring: [], latencies: [], flushTimer: null };
+   138→    liveStates.set(serviceId, st);
+   139→  }
+   140→  return st;
+   141→}
+   142→
+   143→async function loadPersistedStats(serviceId: string): Promise<void> {
+   144→  try {
+   145→    const row = await db.serviceData.findUnique({
+   146→      where: { serviceId_key: { serviceId, key: STATS_KEY } },
+   147→      select: { valueJson: true },
+   148→    });
+   149→    if (!row) return;
+   150→    const saved = safeParse<Partial<LiveState['stats']> | null>(row.valueJson, null);
+   151→    if (saved && typeof saved.totalRequests === 'number') {
+   152→      const st = getLiveState(serviceId);
+   153→      st.stats = { ...emptyStats(), ...saved, byPath: saved.byPath ?? {} };
+   154→    }
+   155→  } catch {
+   156→    /* stats are best-effort */
+   157→  }
+   158→}
+   159→
+   160→function scheduleStatsFlush(serviceId: string): void {
+   161→  const st = getLiveState(serviceId);
+   162→  if (st.flushTimer) return;
+   163→  st.flushTimer = setTimeout(() => {
+   164→    st.flushTimer = null;
+   165→    const snapshot = JSON.stringify(st.stats);
+   166→    db.serviceData
+   167→      .upsert({
+   168→        where: { serviceId_key: { serviceId, key: STATS_KEY } },
+   169→        update: { valueJson: snapshot },
+   170→        create: { serviceId, key: STATS_KEY, valueJson: snapshot },
+   171→      })
+   172→      .catch(() => {});
+   173→  }, 2500);
+   174→  st.flushTimer.unref?.();
+   175→}
+   176→
+   177→function recordRequest(serviceId: string, entry: { method: string; path: string; status: number; ms: number }): void {
+   178→  const st = getLiveState(serviceId);
+   179→  st.stats.totalRequests += 1;
+   180→  if (entry.status < 400) st.stats.okResponses += 1;
+   181→  else st.stats.errorResponses += 1;
+   182→  st.stats.totalMs += entry.ms;
+   183→  st.stats.lastRequestAt = new Date().toISOString();
+   184→
+   185→  const bucket = st.stats.byPath[entry.path] ?? { count: 0, totalMs: 0 };
+   186→  bucket.count += 1;
+   187→  bucket.totalMs += entry.ms;
+   188→  st.stats.byPath[entry.path] = bucket;
+   189→
+   190→  st.ring.push({ ...entry, at: new Date().toISOString() });
+   191→  if (st.ring.length > RING_CAP) st.ring.splice(0, st.ring.length - RING_CAP);
+   192→
+   193→  st.latencies.push(entry.ms);
+   194→  if (st.latencies.length > LATENCY_CAP) st.latencies.splice(0, st.latencies.length - LATENCY_CAP);
+   195→
+   196→  scheduleStatsFlush(serviceId);
+   197→}
+   198→
+   199→function percentile(values: number[], p: number): number {
+   200→  if (!values.length) return 0;
+   201→  const sorted = [...values].sort((a, b) => a - b);
+   202→  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+   203→  return Math.round(sorted[Math.max(0, idx)]);
+   204→}
+   205→
+   206→// ─── the deployed application's interactive console page ─────────────────────
+   207→
+   208→interface RunnerMeta {
+   209→  type: string;
+   210→  commit: string;
+   211→  branch: string;
+   212→  tier: string;
+   213→  region: string;
+   214→  description: string;
+   215→  protocol: string;
+   216→}
+   217→
+   218→function renderAppPage(name: string, meta: RunnerMeta, streamEnabled: boolean): string {
+   219→  const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] ?? c));
+   220→
+   221→  const methodChip = (m: string) => {
+   222→    const cls = m === 'GET' ? 'm-get' : m === 'POST' ? 'm-post' : m === 'PUT' ? 'm-put' : m === 'DELETE' ? 'm-del' : 'm-other';
+   223→    return `<span class="method ${cls}">${m}</span>`;
+   224→  };
+   225→
+   226→  const endpoints: [string, string, string][] = [
+   227→    ['GET', '/health', 'Liveness probe used by the platform health checker'],
+   228→    ['GET', '/api/meta', 'Service metadata & runtime info'],
+   229→    ['GET', '/api/stats', 'Real request counters, latency percentiles, per-path breakdown'],
+   230→    ['GET', '/api/time', 'Server clock (RFC 3339 + epoch ms)'],
+   231→    ['POST', '/api/echo', 'Echoes your request body back with envelope metadata'],
+   232→    ['GET', '/api/kv', 'List the persistent data store contents'],
+   233→    ['PUT', '/api/kv/{key}', 'Create or update a key — survives restarts & redeploys'],
+   234→    ['DELETE', '/api/kv/{key}', 'Remove a key'],
+   235→    ['GET', '/api/requests', 'Last 50 requests served by this runner'],
+   236→  ];
+   237→  if (streamEnabled) endpoints.push(['GET', '/sse', 'Server-Sent Events stream — live heartbeats every second']);
+   238→
+   239→  const endpointRows = endpoints
+   240→    .map(
+   241→      ([m, p, d]) =>
+   242→        `<div class="ep">${methodChip(m)}<span class="path">${esc(p)}</span><span class="epdesc">${esc(d)}</span></div>`
+   243→    )
+   244→    .join('');
+   245→
+   246→  return `<!doctype html>
+   247→<html lang="en"><head><meta charset="utf-8"/>
+   248→<meta name="viewport" content="width=device-width, initial-scale=1"/>
+   249→<title>${esc(name)} — live on NexusHost</title>
+   250→<style>
+   251→  :root { color-scheme: dark; --bg:#090a0f; --card:#101116; --line:#26262c; --line2:#1d1d23;
+   252→          --txt:#e4e4e7; --dim:#a1a1aa; --faint:#61616b; --ok:#34d399; --warn:#fbbf24;
+   253→          --teal:#2dd4bf; --red:#f87171; --accent:#f4f4f5; }
+   254→  * { box-sizing:border-box; margin:0; }
+   255→  html { -webkit-text-size-adjust:100%; }
+   256→  body { background:var(--bg); color:var(--txt); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+   257→         font-size:14px; line-height:1.5; padding-bottom:env(safe-area-inset-bottom); }
+   258→  .wrap { max-width:880px; margin:0 auto; padding:0 14px 40px; }
+   259→  header { position:sticky; top:0; z-index:10; background:rgba(9,10,15,.94); backdrop-filter:blur(8px);
+   260→           border-bottom:1px solid var(--line2); padding:12px 0; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+   261→  .dot { width:9px; height:9px; border-radius:99px; background:var(--ok); box-shadow:0 0 10px #34d39988; flex:none; }
+   262→  .brand { font-weight:700; font-size:16px; color:var(--accent); }
+   263→  .chip { font-size:10px; letter-spacing:1.5px; text-transform:uppercase; border:1px solid var(--line);
+   264→          border-radius:99px; padding:2px 8px; color:var(--dim); }
+   265→  #uptime { margin-left:auto; font-size:11px; color:var(--dim); white-space:nowrap; }
+   266→  .stats { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin:16px 0 14px; }
+   267→  @media(min-width:640px){ .stats{grid-template-columns:repeat(4,1fr);} }
+   268→  .stat { background:var(--card); border:1px solid var(--line2); border-radius:12px; padding:10px 12px; }
+   269→  .stat b { display:block; font-size:16px; color:var(--accent); font-variant-numeric:tabular-nums; }
+   270→  .stat span { font-size:10px; letter-spacing:1.5px; color:var(--faint); text-transform:uppercase; }
+   271→  nav.tabs { display:flex; gap:2px; overflow-x:auto; border-bottom:1px solid var(--line2); margin-bottom:14px;
+   272→             scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+   273→  nav.tabs::-webkit-scrollbar { display:none; }
+   274→  .tab { flex:none; background:none; border:none; color:var(--dim); font:inherit; font-size:12.5px; padding:11px 13px;
+   275→         cursor:pointer; border-bottom:2px solid transparent; min-height:44px; }
+   276→  .tab[aria-selected="true"] { color:var(--accent); border-bottom-color:var(--ok); }
+   277→  .pane { display:none; }
+   278→  .pane.active { display:block; }
+   279→  .card { background:var(--card); border:1px solid var(--line2); border-radius:14px; padding:16px; margin-bottom:12px; }
+   280→  h2 { font-size:12px; letter-spacing:1.5px; text-transform:uppercase; color:var(--dim); margin-bottom:12px; }
+   281→  p.desc { color:var(--dim); font-size:13px; margin-bottom:14px; }
+   282→  table.meta { width:100%; border-collapse:collapse; font-size:12px; }
+   283→  table.meta td { padding:8px 0; border-bottom:1px solid var(--line2); color:var(--dim); }
+   284→  table.meta td:last-child { color:var(--txt); text-align:right; }
+   285→  table.meta tr:last-child td { border-bottom:none; }
+   286→  .ok { color:var(--ok); }
+   287→  .ep { display:flex; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid var(--line2);
+   288→        font-size:12px; flex-wrap:wrap; }
+   289→  .ep:last-child { border-bottom:none; }
+   290→  .epdesc { color:var(--faint); font-size:11px; flex-basis:100%; padding-left:2px; }
+   291→  .method { font-size:10px; font-weight:700; border-radius:6px; padding:2px 7px; letter-spacing:1px; flex:none; }
+   292→  .m-get { background:#0f2e22; color:var(--ok); }
+   293→  .m-post { background:#2e260f; color:var(--warn); }
+   294→  .m-put { background:#0f2b28; color:var(--teal); }
+   295→  .m-del { background:#2e1414; color:var(--red); }
+   296→  .m-other { background:#232329; color:var(--dim); }
+   297→  .path { color:var(--txt); word-break:break-all; }
+   298→  button.btn { font:inherit; font-size:12.5px; background:#1a1a21; color:var(--txt); border:1px solid var(--line);
+   299→               border-radius:9px; padding:10px 16px; min-height:44px; cursor:pointer; }
+   300→  button.btn:active { background:#24242c; }
+   301→  button.btn:disabled { opacity:.55; cursor:wait; }
+   302→  button.btn.primary { background:#12241d; border-color:#1e4033; color:var(--ok); }
+   303→  label { display:block; font-size:10px; letter-spacing:1.5px; text-transform:uppercase; color:var(--faint); margin:12px 0 5px; }
+   304→  textarea, input[type="text"] { width:100%; background:#0c0d12; border:1px solid var(--line); border-radius:9px;
+   305→         color:var(--txt); font:inherit; font-size:12.5px; padding:10px 12px; }
+   306→  textarea { min-height:88px; resize:vertical; }
+   307→  textarea:focus, input:focus { outline:1px solid #3f3f46; }
+   308→  pre.out { background:#0c0d12; border:1px solid var(--line2); border-radius:10px; padding:12px; font-size:11.5px;
+   309→            overflow-x:auto; max-height:340px; overflow-y:auto; white-space:pre; margin:0; }
+   310→  .res-head { display:flex; gap:8px; align-items:center; margin:12px 0 7px; flex-wrap:wrap; font-size:11px; color:var(--dim); }
+   311→  .res-head .spacer { margin-left:auto; }
+   312→  .copy { min-height:32px; padding:4px 10px; font-size:11px; border-radius:7px; }
+   313→  .status-pill { font-weight:700; border-radius:6px; padding:2px 8px; font-size:10px; letter-spacing:1px; }
+   314→  .sp-ok { background:#0f2e22; color:var(--ok); }
+   315→  .sp-err { background:#2e1414; color:var(--red); }
+   316→  .rows { display:flex; flex-direction:column; gap:6px; }
+   317→  .row { display:flex; gap:8px; align-items:center; background:#0c0d12; border:1px solid var(--line2);
+   318→         border-radius:9px; padding:9px 11px; font-size:11.5px; flex-wrap:wrap; }
+   319→  .row .p { color:var(--txt); word-break:break-all; }
+   320→  .row .meta2 { color:var(--faint); font-size:10px; margin-left:auto; white-space:nowrap; }
+   321→  .row .v { color:var(--dim); flex-basis:100%; font-size:11px; word-break:break-all; }
+   322→  .del { color:var(--red); background:none; border:1px solid #7f1d1d; border-radius:9px; min-height:44px;
+   323→         min-width:44px; cursor:pointer; font:inherit; font-size:11px; padding:4px 10px; }
+   324→  .muted { color:var(--faint); font-size:12px; }
+   325→  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+   326→  .toolbar .spacer { margin-left:auto; }
+   327→  footer { margin-top:26px; font-size:11px; color:var(--faint); text-align:center; line-height:1.7; }
+   328→  footer code { background:#18181b; border:1px solid var(--line); padding:1px 6px; border-radius:6px; font-size:10.5px; }
+   329→  #toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#1a1a21; border:1px solid var(--line);
+   330→           border-radius:10px; padding:10px 18px; font-size:12px; opacity:0; transition:opacity .18s; pointer-events:none;
+   331→           z-index:50; max-width:88vw; }
+   332→  #toast.show { opacity:1; }
+   333→  .sse-stat { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--dim); flex-wrap:wrap; }
+   334→  .pulse { width:8px; height:8px; border-radius:99px; background:var(--faint); }
+   335→  .pulse.on { background:var(--ok); box-shadow:0 0 8px #34d39988; }
+   336→</style></head>
+   337→<body>
+   338→<div class="wrap">
+   339→  <header>
+   340→    <span class="dot" id="dot"></span>
+   341→    <span class="brand">${esc(name)}</span>
+   342→    <span class="chip">${esc(meta.type)}</span>
+   343→    <span class="chip">${esc(meta.protocol)}</span>
+   344→    <span id="uptime">uptime —</span>
+   345→  </header>
+   346→
+   347→  <div class="stats">
+   348→    <div class="stat"><b id="s-reqs">—</b><span>requests</span></div>
+   349→    <div class="stat"><b id="s-avg">—</b><span>avg latency</span></div>
+   350→    <div class="stat"><b id="s-p95">—</b><span>p95 latency</span></div>
+   351→    <div class="stat"><b id="s-err">—</b><span>errors</span></div>
+   352→  </div>
+   353→
+   354→  <nav class="tabs" role="tablist">
+   355→    <button class="tab" role="tab" aria-selected="true" data-tab="overview">Overview</button>
+   356→    <button class="tab" role="tab" aria-selected="false" data-tab="playground">API Playground</button>
+   357→    <button class="tab" role="tab" aria-selected="false" data-tab="data">Data Store</button>
+   358→    <button class="tab" role="tab" aria-selected="false" data-tab="feed">Live Feed</button>
+   359→  </nav>
+   360→
+   361→  <section class="pane active" id="pane-overview" role="tabpanel">
+   362→    <div class="card">
+   363→      <p class="desc">${esc(meta.description || 'Deployed and served by the NexusHost builtin runner — every button on this page sends real HTTP requests to this running service.')}</p>
+   364→      <table class="meta">
+   365→        <tr><td>Commit</td><td>${esc(meta.commit)} (${esc(meta.branch)})</td></tr>
+   366→        <tr><td>Hardware tier</td><td>${esc(meta.tier)}</td></tr>
+   367→        <tr><td>Region</td><td>${esc(meta.region)}</td></tr>
+   368→        <tr><td>Health check</td><td class="ok">passing — <span style="color:var(--dim)">GET /health</span></td></tr>
+   369→        <tr><td>Runner</td><td>builtin · pid <span id="m-pid">…</span> · port <span id="m-port">…</span></td></tr>
+   370→      </table>
+   371→    </div>
+   372→    <div class="card">
+   373→      <h2>Endpoints — all live, try them in the Playground</h2>
+   374→      ${endpointRows}
+   375→    </div>
+   376→  </section>
+   377→
+   378→  <section class="pane" id="pane-playground" role="tabpanel">
+   379→    <div class="card">
+   380→      <h2>Request</h2>
+   381→      <div class="ep" style="border:none;padding-top:0">${methodChip('GET')}<span class="path">/health</span>
+   382→        <span class="epdesc" style="flex-basis:100%">Platform liveness probe</span>
+   383→        <button class="btn primary" id="go-health" style="margin-left:auto">Send</button></div>
+   384→      <div class="ep" style="border:none">${methodChip('GET')}<span class="path">/api/time</span>
+   385→        <span class="epdesc" style="flex-basis:100%">Server clock</span>
+   386→        <button class="btn primary" id="go-time" style="margin-left:auto">Send</button></div>
+   387→      <div class="ep" style="border:none">${methodChip('GET')}<span class="path">/api/stats</span>
+   388→        <span class="epdesc" style="flex-basis:100%">Real traffic metrics for this deployment</span>
+   389→        <button class="btn primary" id="go-stats" style="margin-left:auto">Send</button></div>
+   390→      <label for="echo-body">POST /api/echo — request body (JSON)</label>
+   391→      <textarea id="echo-body" spellcheck="false">{"hello":"world","from":"${esc(name)}"}</textarea>
+   392→      <div style="margin-top:10px;display:flex;justify-content:flex-end">
+   393→        <button class="btn primary" id="go-echo">Send echo</button></div>
+   394→    </div>
+   395→    <div class="card" id="res-card">
+   396→      <h2>Response</h2>
+   397→      <p class="muted" id="res-empty">Send a request — the response, status code and real latency will show up here.</p>
+   398→      <div id="res-out"></div>
+   399→    </div>
+   400→  </section>
+   401→
+   402→  <section class="pane" id="pane-data" role="tabpanel">
+   403→    <div class="card">
+   404→      <h2>Persistent key/value store — stored in the control-plane database</h2>
+   405→      <label for="kv-key">Key</label>
+   406→      <input type="text" id="kv-key" placeholder="e.g. greeting" autocomplete="off" />
+   407→      <label for="kv-value">Value (raw text or JSON)</label>
+   408→      <textarea id="kv-value" spellcheck="false" style="min-height:64px">{"msg":"saved at runtime"}</textarea>
+   409→      <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+   410→        <button class="btn" id="kv-refresh">Refresh</button>
+   411→        <button class="btn primary" id="kv-save">Save key</button>
+   412→      </div>
+   413→    </div>
+   414→    <div class="card">
+   415→      <h2>Stored entries <span class="muted" id="kv-count"></span></h2>
+   416→      <div class="rows" id="kv-rows"><p class="muted">Loading…</p></div>
+   417→    </div>
+   418→  </section>
+   419→
+   420→  <section class="pane" id="pane-feed" role="tabpanel">
+   421→    ${streamEnabled ? `<div class="card">
+   422→      <h2>SSE live stream — GET /sse</h2>
+   423→      <div class="sse-stat"><span class="pulse" id="sse-pulse"></span><span id="sse-state">connecting…</span>
+   424→        <span class="chip" id="sse-count" style="margin-left:auto">0 events</span></div>
+   425→      <pre class="out" id="sse-log" style="margin-top:10px;max-height:200px">waiting for events…</pre>
+   426→    </div>` : ''}
+   427→    <div class="card">
+   428→      <div class="toolbar"><h2 style="margin:0">Requests served by this runner</h2>
+   429→        <span class="spacer"></span><button class="btn" id="feed-toggle">Pause</button></div>
+   430→      <div class="rows" id="feed-rows"><p class="muted">Loading…</p></div>
+   431→    </div>
+   432→  </section>
+   433→
+   434→  <footer>
+   435→    Served by the NexusHost builtin runner · ingress <code>/api/ingress/${esc(name)}</code><br/>
+   436→    custom hostname <code>${esc(name)}.nexushost.dev</code> resolves once wildcard DNS points at this host
+   437→  </footer>
+   438→</div>
+   439→<div id="toast" role="status" aria-live="polite"></div>
+   440→<script>
+   441→(function () {
+   442→  'use strict';
+   443→  var BASE = location.pathname.replace(/\\/+$/, '') + '/';
+   444→  var STREAM = ${streamEnabled ? 'true' : 'false'};
+   445→  var STARTED_AT = Date.now();
+   446→
+   447→  function $(id) { return document.getElementById(id); }
+   448→  function esc(s) {
+   449→    return String(s).replace(/[&<>"']/g, function (c) {
+   450→      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+   451→    });
+   452→  }
+   453→  function pretty(v) { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+   454→  function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : Math.round(ms) + ' ms'; }
+   455→  function fmtUptime(sec) {
+   456→    var d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+   457→    var out = '';
+   458→    if (d) out += d + 'd ';
+   459→    if (d || h) out += h + 'h ';
+   460→    if (d || h || m) out += m + 'm ';
+   461→    out += s + 's';
+   462→    return out;
+   463→  }
+   464→  function toast(msg) {
+   465→    var t = $('toast'); t.textContent = msg; t.classList.add('show');
+   466→    clearTimeout(t._h); t._h = setTimeout(function () { t.classList.remove('show'); }, 1700);
+   467→  }
+   468→  function copyText(txt) {
+   469→    function fallback() {
+   470→      var ta = document.createElement('textarea'); ta.value = txt;
+   471→      document.body.appendChild(ta); ta.select();
+   472→      try { document.execCommand('copy'); toast('Copied to clipboard'); } catch (e) { toast('Copy failed'); }
+   473→      document.body.removeChild(ta);
+   474→    }
+   475→    if (navigator.clipboard && navigator.clipboard.writeText) {
+   476→      navigator.clipboard.writeText(txt).then(function () { toast('Copied to clipboard'); }, fallback);
+   477→    } else fallback();
+   478→  }
+   479→
+   480→  // ── tabs ──
+   481→  var tabs = document.querySelectorAll('.tab');
+   482→  Array.prototype.forEach.call(tabs, function (tab) {
+   483→    tab.addEventListener('click', function () {
+   484→      Array.prototype.forEach.call(tabs, function (t) { t.setAttribute('aria-selected', t === tab ? 'true' : 'false'); });
+   485→      var panes = document.querySelectorAll('.pane');
+   486→      Array.prototype.forEach.call(panes, function (p) { p.classList.toggle('active', p.id === 'pane-' + tab.dataset.tab); });
+   487→      if (tab.dataset.tab === 'data') loadKV();
+   488→      if (tab.dataset.tab === 'feed') { loadFeed(); if (STREAM && !sseConnected) connectSSE(); }
+   489→    });
+   490→  });
+   491→
+   492→  // ── request sender ──
+   493→  function send(method, path, body, btn) {
+   494→    var t0 = performance.now();
+   495→    if (btn) { btn.disabled = true; btn._old = btn.textContent; btn.textContent = 'Sending…'; }
+   496→    var opts = { method: method, cache: 'no-store' };
+   497→    if (body != null) { opts.headers = { 'content-type': 'application/json' }; opts.body = body; }
+   498→    fetch(BASE + path.replace(/^\\/+/, ''), opts)
+   499→      .then(function (r) {
+   500→        return r.text().then(function (txt) { return { status: r.status, ok: r.ok, txt: txt }; });
+   501→      })
+   502→      .then(function (res) {
+   503→        var ms = performance.now() - t0;
+   504→        var parsed = null, bodyTxt = res.txt;
+   505→        try { parsed = JSON.parse(res.txt); bodyTxt = pretty(parsed); } catch (e) { if (!res.txt) bodyTxt = '(empty body)'; }
+   506→        $('res-empty').style.display = 'none';
+   507→        var pill = res.ok ? 'sp-ok' : 'sp-err';
+   508→        var html = '<div class="res-head">' +
+   509→          '<span class="status-pill ' + pill + '">' + res.status + '</span>' +
+   510→          '<span>' + fmtMs(ms) + '</span>' + '<span>' + esc(method) + ' ' + esc(path) + '</span>' +
+   511→          '<span class="spacer"></span><button class="btn copy" id="res-copy">Copy</button></div>' +
+   512→          '<pre class="out">' + esc(bodyTxt) + '</pre>';
+   513→        $('res-out').innerHTML = html;
+   514→        $('res-copy').addEventListener('click', function () { copyText(bodyTxt); });
+   515→        refreshStats();
+   516→      })
+   517→      .catch(function (err) {
+   518→        $('res-empty').style.display = 'none';
+   519→        $('res-out').innerHTML = '<div class="res-head"><span class="status-pill sp-err">ERR</span></div>' +
+   520→          '<pre class="out">request failed: ' + esc(String(err)) + '</pre>';
+   521→      })
+   522→      .then(function () {
+   523→        if (btn) { btn.disabled = false; btn.textContent = btn._old; }
+   524→      });
+   525→  }
+   526→
+   527→  $('go-health').addEventListener('click', function () { send('GET', '/health', null, this); });
+   528→  $('go-time').addEventListener('click', function () { send('GET', '/api/time', null, this); });
+   529→  $('go-stats').addEventListener('click', function () { send('GET', '/api/stats', null, this); });
+   530→  $('go-echo').addEventListener('click', function () {
+   531→    var raw = $('echo-body').value;
+   532→    send('POST', '/api/echo', raw.trim() === '' ? null : raw, this);
+   533→  });
+   534→
+   535→  // ── stats strip + uptime ──
+   536→  function refreshStats() {
+   537→    fetch(BASE + 'api/stats', { cache: 'no-store' })
+   538→      .then(function (r) { return r.json(); })
+   539→      .then(function (s) {
+   540→        if (s.startedAtMs) STARTED_AT = s.startedAtMs;
+   541→        if (s.runtime) { $('m-pid').textContent = s.runtime.pid; $('m-port').textContent = s.runtime.port; }
+   542→        $('s-reqs').textContent = s.totalRequests;
+   543→        $('s-avg').textContent = s.totalRequests ? fmtMs(s.totalMs / s.totalRequests) : '—';
+   544→        $('s-p95').textContent = s.totalRequests ? fmtMs(s.p95LatencyMs) : '—';
+   545→        $('s-err').textContent = s.errorResponses;
+   546→      })
+   547→      .catch(function () {});
+   548→  }
+   549→  setInterval(function () { $('uptime').textContent = 'uptime ' + fmtUptime((Date.now() - STARTED_AT) / 1000); }, 1000);
+   550→  setInterval(function () { if (!document.hidden) refreshStats(); }, 5000);
+   551→  refreshStats();
+   552→
+   553→  // ── kv store ──
+   554→  function loadKV() {
+   555→    fetch(BASE + 'api/kv', { cache: 'no-store' })
+   556→      .then(function (r) { return r.json(); })
+   557→      .then(function (data) {
+   558→        var entries = data.data || [];
+   559→        $('kv-count').textContent = entries.length ? '(' + entries.length + ')' : '';
+   560→        if (!entries.length) { $('kv-rows').innerHTML = '<p class="muted">No keys yet — save one above, it persists in the control-plane database.</p>'; return; }
+   561→        var html = '';
+   562→        Array.prototype.forEach.call(entries, function (e) {
+   563→          html += '<div class="row"><span class="method m-put">' + esc(e.key) + '</span>' +
+   564→            '<span class="meta2">' + esc(new Date(e.updatedAt).toLocaleString()) + '</span>' +
+   565→            '<button class="del" data-key="' + esc(e.key) + '">Delete</button>' +
+   566→            '<span class="v">' + esc(typeof e.value === 'string' ? e.value : pretty(e.value)) + '</span></div>';
+   567→        });
+   568→        $('kv-rows').innerHTML = html;
+   569→        var dels = $('kv-rows').querySelectorAll('.del');
+   570→        Array.prototype.forEach.call(dels, function (btn) {
+   571→          btn.addEventListener('click', function () {
+   572→            var key = btn.dataset.key;
+   573→            btn.disabled = true;
+   574→            fetch(BASE + 'api/kv/' + encodeURIComponent(key), { method: 'DELETE' })
+   575→              .then(function (r) { toast(r.ok ? 'Deleted "' + key + '"' : 'Delete failed'); loadKV(); refreshStats(); })
+   576→              .catch(function () { toast('Delete failed'); btn.disabled = false; });
+   577→          });
+   578→        });
+   579→      })
+   580→      .catch(function () { $('kv-rows').innerHTML = '<p class="muted">Failed to load entries.</p>'; });
+   581→  }
+   582→  $('kv-refresh').addEventListener('click', loadKV);
+   583→  $('kv-save').addEventListener('click', function () {
+   584→    var key = $('kv-key').value.trim();
+   585→    if (!key) { toast('Enter a key first'); return; }
+   586→    var raw = $('kv-value').value;
+   587→    var btn = this; btn.disabled = true;
+   588→    fetch(BASE + 'api/kv/' + encodeURIComponent(key), {
+   589→      method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw,
+   590→    })
+   591→      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+   592→      .then(function (res) {
+   593→        toast(res.ok ? 'Saved "' + key + '" to the data store' : (res.j.error || 'Save failed'));
+   594→        if (res.ok) loadKV();
+   595→        refreshStats();
+   596→      })
+   597→      .catch(function () { toast('Save failed'); })
+   598→      .then(function () { btn.disabled = false; });
+   599→  });
+   600→
+   601→  // ── live feed ──
+   602→  var feedPaused = false;
+   603→  $('feed-toggle').addEventListener('click', function () {
+   604→    feedPaused = !feedPaused;
+   605→    this.textContent = feedPaused ? 'Resume' : 'Pause';
+   606→    if (!feedPaused) loadFeed();
+   607→  });
+   608→  function statusPill(code) {
+   609→    var cls = code < 400 ? 'sp-ok' : 'sp-err';
+   610→    return '<span class="status-pill ' + cls + '">' + code + '</span>';
+   611→  }
+   612→  function methodChip(m) {
+   613→    var cls = m === 'GET' ? 'm-get' : m === 'POST' ? 'm-post' : m === 'PUT' ? 'm-put' : m === 'DELETE' ? 'm-del' : 'm-other';
+   614→    return '<span class="method ' + cls + '">' + esc(m) + '</span>';
+   615→  }
+   616→  function loadFeed() {
+   617→    if (feedPaused) return;
+   618→    fetch(BASE + 'api/requests', { cache: 'no-store' })
+   619→      .then(function (r) { return r.json(); })
+   620→      .then(function (data) {
+   621→        var rows = (data.data || []).slice().reverse();
+   622→        if (!rows.length) { $('feed-rows').innerHTML = '<p class="muted">No requests yet — hit Send in the Playground or refresh the page.</p>'; return; }
+   623→        var html = '';
+   624→        Array.prototype.forEach.call(rows, function (r) {
+   625→          html += '<div class="row">' + methodChip(r.method) + '<span class="p">' + esc(r.path) + '</span>' +
+   626→            statusPill(r.status) + '<span class="meta2">' + fmtMs(r.ms) + ' · ' + esc(new Date(r.at).toLocaleTimeString()) + '</span></div>';
+   627→        });
+   628→        $('feed-rows').innerHTML = html;
+   629→      })
+   630→      .catch(function () {});
+   631→  }
+   632→  setInterval(function () { if (!document.hidden) loadFeed(); }, 2500);
+   633→  loadFeed();
+   634→
+   635→  // ── sse stream ──
+   636→  var sseConnected = false, sseEvents = 0;
+   637→  function connectSSE() {
+   638→    if (!STREAM || sseConnected) return;
+   639→    sseConnected = true;
+   640→    var es = new EventSource(BASE + 'sse');
+   641→    function onEvent(ev) {
+   642→      sseEvents += 1;
+   643→      $('sse-count').textContent = sseEvents + ' events';
+   644→      $('sse-state').textContent = 'connected — heartbeats arriving live';
+   645→      $('sse-pulse').classList.add('on');
+   646→      $('sse-log').textContent = (sseEvents > 1 ? $('sse-log').textContent + '\\n' : '') + ev.data;
+   647→      var lines = $('sse-log').textContent.split('\\n');
+   648→      if (lines.length > 8) $('sse-log').textContent = lines.slice(-8).join('\\n');
+   649→    }
+   650→    es.addEventListener('heartbeat', onEvent);
+   651→    es.onopen = function () { $('sse-state').textContent = 'connected — heartbeats arriving live'; $('sse-pulse').classList.add('on'); };
+   652→    es.onerror = function () { $('sse-state').textContent = 'reconnecting…'; $('sse-pulse').classList.remove('on'); };
+   653→  }
+   654→  if (STREAM) connectSSE();
+   655→})();
+   656→</script>
+   657→</body></html>`;
+   658→}
+   659→
+   660→// ─── the runner HTTP app ─────────────────────────────────────────────────────
+   661→
+   662→function readBody(req: http.IncomingMessage): Promise<Buffer> {
+   663→  return new Promise((resolve, reject) => {
+   664→    const chunks: Buffer[] = [];
+   665→    req.on('data', (c: Buffer) => {
+   666→      chunks.push(c);
+   667→      if (chunks.reduce((n, b) => n + b.length, 0) > MAX_VALUE_BYTES + 4096) {
+   668→        reject(new Error('payload too large'));
+   669→        req.destroy();
+   670→      }
+   671→    });
+   672→    req.on('end', () => resolve(Buffer.concat(chunks)));
+   673→    req.on('error', reject);
+   674→  });
+   675→}
+   676→
+   677→function sendJson(res: http.ServerResponse, code: number, obj: unknown): void {
+   678→  const body = JSON.stringify(obj, null, 2);
+   679→  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+   680→  res.end(body);
+   681→}
+   682→
+   683→function normalizeUrl(raw: string): string {
+   684→  const q = raw.indexOf('?');
+   685→  const path = q === -1 ? raw : raw.slice(0, q);
+   686→  if (path === '/' || path === '') return '/';
+   687→  return path.replace(/\/+$/, '') || '/';
+   688→}
+   689→
+   690→function createRunnerApp(
+   691→  serviceId: string,
+   692→  name: string,
+   693→  meta: RunnerMeta,
+   694→  port: number
+   695→): http.Server {
+   696→  const streamEnabled = meta.protocol === 'sse' || meta.type === 'mcp';
+   697→  const bootAt = Date.now();
+   698→
+   699→  async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+   700→    const url = normalizeUrl(req.url ?? '/');
+   701→    const method = (req.method ?? 'GET').toUpperCase();
+   702→
+   703→    // CORS-friendly preflight (harmless same-origin, useful for direct API use)
+   704→    if (method === 'OPTIONS') {
+   705→      res.writeHead(204, {
+   706→        'access-control-allow-origin': '*',
+   707→        'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+   708→        'access-control-allow-headers': 'content-type',
+   709→      });
+   710→      res.end();
+   711→      return;
+   712→    }
+   713→
+   714→    if (url === '/health') {
+   715→      sendJson(res, 200, { status: 'ok', service: name, uptimeSec: Math.round((Date.now() - bootAt) / 1000) });
+   716→      return;
+   717→    }
+   718→
+   719→    if (url === '/api/meta') {
+   720→      sendJson(res, 200, {
+   721→        service: name,
+   722→        type: meta.type,
+   723→        protocol: meta.protocol,
+   724→        description: meta.description,
+   725→        commit: meta.commit,
+   726→        branch: meta.branch,
+   727→        hardwareTier: meta.tier,
+   728→        region: meta.region,
+   729→        console: 'GET / opens the interactive console',
+   730→        runtime: { mode: 'builtin-runner', version: RUNNER_VERSION },
+   731→        endpoints: ['GET /health', 'GET /api/meta', 'GET /api/stats', 'GET /api/time', 'POST /api/echo', 'GET /api/kv', 'PUT /api/kv/{key}', 'DELETE /api/kv/{key}', 'GET /api/requests'].concat(streamEnabled ? ['GET /sse'] : []),
+   732→      });
+   733→      return;
+   734→    }
+   735→
+   736→    if (url === '/api/stats') {
+   737→      const st = getLiveState(serviceId);
+   738→      const last60 = st.ring.filter((r) => Date.now() - new Date(r.at).getTime() < 60_000);
+   739→      sendJson(res, 200, {
+   740→        service: name,
+   741→        startedAtMs: bootAt,
+   742→        startedAt: new Date(bootAt).toISOString(),
+   743→        uptimeSec: Math.round((Date.now() - bootAt) / 1000),
+   744→        totalRequests: st.stats.totalRequests,
+   745→        okResponses: st.stats.okResponses,
+   746→        errorResponses: st.stats.errorResponses,
+   747→        totalMs: Math.round(st.stats.totalMs),
+   748→        avgLatencyMs: st.stats.totalRequests ? Math.round(st.stats.totalMs / st.stats.totalRequests) : 0,
+   749→        p95LatencyMs: percentile(st.latencies, 95),
+   750→        requestsLast60s: last60.length,
+   751→        requestsPerMin: last60.length,
+   752→        byPath: st.stats.byPath,
+   753→        lastRequestAt: st.stats.lastRequestAt,
+   754→        runtime: { pid: process.pid, port, mode: 'builtin-runner' },
+   755→      });
+   756→      return;
+   757→    }
+   758→
+   759→    if (url === '/api/time') {
+   760→      const now = new Date();
+   761→      sendJson(res, 200, { iso: now.toISOString(), epochMs: now.getTime(), timezone: 'UTC', runnerUptimeSec: Math.round((Date.now() - bootAt) / 1000) });
+   762→      return;
+   763→    }
+   764→
+   765→    if (url === '/api/echo') {
+   766→      let raw = '';
+   767→      let payload: unknown = null;
+   768→      try {
+   769→        raw = (await readBody(req)).toString('utf8');
+   770→      } catch {
+   771→        sendJson(res, 413, { error: `Body too large (max ${Math.round(MAX_VALUE_BYTES / 1024)} KB)` });
+   772→        return;
+   773→      }
+   774→      payload = raw ? safeParse<unknown>(raw, raw) : null;
+   775→      sendJson(res, 200, {
+   776→        service: name,
+   777→        method,
+   778→        receivedAt: new Date().toISOString(),
+   779→        contentType: req.headers['content-type'] ?? null,
+   780→        bodyBytes: raw.length,
+   781→        body: payload,
+   782→      });
+   783→      return;
+   784→    }
+   785→
+   786→    if (url === '/api/kv' && method === 'GET') {
+   787→      const rows = await db.serviceData.findMany({
+   788→        where: { serviceId },
+   789→        orderBy: { updatedAt: 'desc' },
+   790→      });
+   791→      // NOTE: filter internal "__" keys in JS — SQLite LIKE treats "_" as a
+   792→      // wildcard, so a NOT startsWith('__') clause would exclude everything.
+   793→      sendJson(res, 200, {
+   794→        data: rows
+   795→          .filter((r) => !r.key.startsWith('__'))
+   796→          .map((r) => ({ key: r.key, value: safeParse<unknown>(r.valueJson, r.valueJson), updatedAt: r.updatedAt })),
+   797→      });
+   798→      return;
+   799→    }
+   800→
+   801→    if (url.startsWith('/api/kv/')) {
+   802→      const key = decodeURIComponent(url.slice('/api/kv/'.length));
+   803→      if (!key || key.length > MAX_KEY_LEN || key.startsWith('__')) {
+   804→        sendJson(res, 400, { error: 'Invalid key (max 120 chars, no __ prefix)' });
+   805→        return;
+   806→      }
+   807→
+   808→      if (method === 'GET') {
+   809→        const row = await db.serviceData.findUnique({ where: { serviceId_key: { serviceId, key } } });
+   810→        if (!row) {
+   811→          sendJson(res, 404, { error: `Key "${key}" not found`, service: name });
+   812→          return;
+   813→        }
+   814→        sendJson(res, 200, { key: row.key, value: safeParse<unknown>(row.valueJson, row.valueJson), updatedAt: row.updatedAt });
+   815→        return;
+   816→      }
+   817→
+   818→      if (method === 'PUT' || method === 'POST' || method === 'PATCH') {
+   819→        let raw = '';
+   820→        try {
+   821→          raw = (await readBody(req)).toString('utf8');
+   822→        } catch {
+   823→          sendJson(res, 413, { error: `Value too large (max ${Math.round(MAX_VALUE_BYTES / 1024)} KB)` });
+   824→          return;
+   825→        }
+   826→        const row = await db.serviceData.upsert({
+   827→          where: { serviceId_key: { serviceId, key } },
+   828→          update: { valueJson: raw },
+   829→          create: { serviceId, key, valueJson: raw },
+   830→        });
+   831→        sendJson(res, row.createdAt.getTime() === row.updatedAt.getTime() ? 201 : 200, {
+   832→          key: row.key,
+   833→          value: safeParse<unknown>(row.valueJson, row.valueJson),
+   834→          updatedAt: row.updatedAt,
+   835→          persisted: true,
+   836→        });
+   837→        return;
+   838→      }
+   839→
+   840→      if (method === 'DELETE') {
+   841→        try {
+   842→          await db.serviceData.delete({ where: { serviceId_key: { serviceId, key } } });
+   843→          sendJson(res, 200, { deleted: true, key });
+   844→        } catch {
+   845→          sendJson(res, 404, { error: `Key "${key}" not found`, service: name });
+   846→        }
+   847→        return;
+   848→      }
+   849→
+   850→      sendJson(res, 405, { error: `Method ${method} not allowed on /api/kv/{key}` });
+   851→      return;
+   852→    }
+   853→
+   854→    if (url === '/api/requests') {
+   855→      const st = getLiveState(serviceId);
+   856→      sendJson(res, 200, { data: st.ring.slice(-RING_CAP), total: st.stats.totalRequests });
+   857→      return;
+   858→    }
+   859→
+   860→    if (url === '/sse' && streamEnabled) {
+   861→      res.writeHead(200, {
+   862→        'content-type': 'text/event-stream',
+   863→        'cache-control': 'no-cache',
+   864→        connection: 'keep-alive',
+   865→      });
+   866→      let tick = 0;
+   867→      const timer = setInterval(() => {
+   868→        tick += 1;
+   869→        res.write(`event: heartbeat\ndata: ${JSON.stringify({ service: name, tick, at: new Date().toISOString(), uptimeSec: Math.round((Date.now() - bootAt) / 1000) })}\n\n`);
+   870→        if (tick >= 600) { clearInterval(timer); res.end(); }
+   871→      }, 1000);
+   872→      req.on('close', () => clearInterval(timer));
+   873→      return;
+   874→    }
+   875→
+   876→    if (url === '/' || url === '') {
+   877→      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+   878→      res.end(renderAppPage(name, meta, streamEnabled));
+   879→      return;
+   880→    }
+   881→
+   882→    sendJson(res, 404, { error: 'not found', service: name, path: url, hint: 'GET / opens the interactive console — GET /api/meta lists endpoints' });
+   883→  }
+   884→
+   885→  const server = http.createServer((req, res) => {
+   886→    const t0 = Date.now();
+   887→    const rawPath = (req.url ?? '/').split('?')[0] || '/';
+   888→    const isStream = rawPath === '/sse';
+   889→    if (!isStream) {
+   890→      res.on('finish', () => {
+   891→        try {
+   892→          recordRequest(serviceId, { method: (req.method ?? 'GET').toUpperCase(), path: rawPath.slice(0, 120), status: res.statusCode, ms: Date.now() - t0 });
+   893→        } catch {
+   894→          /* metrics must never break serving */
+   895→        }
+   896→      });
+   897→    }
+   898→    route(req, res).catch((err) => {
+   899→      console.error(`[runner:${name}] handler error`, err);
+   900→      if (!res.headersSent) sendJson(res, 500, { error: 'internal runner error', service: name });
+   901→      else res.end();
+   902→    });
+   903→  });
+   904→  (server as http.Server & { __v?: number }).__v = RUNNER_VERSION;
+   905→  return server;
+   906→}
+   907→
+   908→// ─── lifecycle ───────────────────────────────────────────────────────────────
+   909→
+   910→async function startRuntime(svc: {
+   911→  id: string; name: string; type: string; commitHash: string; branch: string;
+   912→  hardwareTier: string; region: string; description: string; protocol: string;
+   913→}): Promise<ServiceRuntime> {
+   914→  const meta: RunnerMeta = {
+   915→    type: svc.type,
+   916→    commit: svc.commitHash,
+   917→    branch: svc.branch,
+   918→    tier: svc.hardwareTier,
+   919→    region: svc.region,
+   920→    description: svc.description,
+   921→    protocol: svc.protocol,
+   922→  };
+   923→
+   924→  const port = await allocatePort(svc.id);
+   925→  const server = createRunnerApp(svc.id, svc.name, meta, port);
+   926→
+   927→  await new Promise<void>((resolve, reject) => {
+   928→    server.once('error', reject);
+   929→    server.listen(port, '127.0.0.1', () => resolve());
+   930→  });
+   931→  runners.set(svc.id, server);
+   932→
+   933→  const state: RuntimeState = {
+   934→    pid: process.pid,
+   935→    port,
+   936→    startedAt: new Date().toISOString(),
+   937→    mode: 'builtin-runner',
+   938→    healthy: true,
+   939→  };
+   940→  await db.service.update({ where: { id: svc.id }, data: { runtimeJson: JSON.stringify(state) } });
+   941→  await loadPersistedStats(svc.id);
+   942→  await writeLog(svc.id, `Runtime for "${svc.name}" is listening on 127.0.0.1:${port} (builtin runner v${RUNNER_VERSION}). Interactive console: /api/ingress/${svc.name}`);
+   943→  return { ...state, healthy: true };
+   944→}
+   945→
+   946→export async function stopRuntime(svc: { id: string; name: string }): Promise<void> {
+   947→  const server = runners.get(svc.id);
+   948→  if (server) {
+   949→    (server as http.Server & { closeIdleConnections?: () => void }).closeIdleConnections?.();
+   950→    await new Promise<void>((resolve) => server.close(() => resolve()));
+   951→    runners.delete(svc.id);
+   952→    await writeLog(svc.id, `Runtime for "${svc.name}" terminated — port released.`);
+   953→  }
+   954→  const row = await db.service.findUnique({ where: { id: svc.id }, select: { runtimeJson: true } });
+   955→  if (row?.runtimeJson) {
+   956→    await db.service.update({ where: { id: svc.id }, data: { runtimeJson: null } });
+   957→  }
+   958→}
+   959→
+   960→async function readRuntimeState(serviceId: string): Promise<RuntimeState | null> {
+   961→  const row = await db.service.findUnique({ where: { id: serviceId }, select: { runtimeJson: true } });
+   962→  return safeParse<RuntimeState | null>(row?.runtimeJson ?? null, null);
+   963→}
+   964→
+   965→/** Replace a stale runner (old app version / unhealthy) with a fresh one. */
+   966→async function replaceRuntime(svc: {
+   967→  id: string; name: string; status: string; type: string; commitHash: string; branch: string;
+   968→  hardwareTier: string; region: string; description: string; protocol: string;
+   969→}): Promise<ServiceRuntime | null> {
+   970→  const old = runners.get(svc.id);
+   971→  if (old) {
+   972→    await new Promise<void>((resolve) => old.close(() => resolve()));
+   973→    runners.delete(svc.id);
+   974→  }
+   975→  return startRuntime(svc);
+   976→}
+   977→
+   978→/**
+   979→ * Reconcile one service with the desired state:
+   980→ *  - running  → guarantee a live listener with the CURRENT app version
+   981→ *  - anything else → guarantee no listener
+   982→ * Returns fresh runtime info for running services.
+   983→ */
+   984→export async function ensureRuntime(svc: {
+   985→  id: string; name: string; status: string; type: string; commitHash: string; branch: string;
+   986→  hardwareTier: string; region: string; description: string; protocol: string;
+   987→}): Promise<ServiceRuntime | null> {
+   988→  if (svc.status !== 'running') {
+   989→    await stopRuntime(svc);
+   990→    return null;
+   991→  }
+   992→
+   993→  const inProcess = runners.get(svc.id);
+   994→  if (inProcess) {
+   995→    const version = (inProcess as http.Server & { __v?: number }).__v;
+   996→    if (version !== RUNNER_VERSION) {
+   997→      return replaceRuntime(svc);
+   998→    }
+   999→    const state = await readRuntimeState(svc.id);
+  1000→    if (state) {
+  1001→      const healthy = await isHealthy(state.port);
+  1002→      if (healthy !== state.healthy) {
+  1003→        const updated = { ...state, healthy };
+  1004→        await db.service.update({ where: { id: svc.id }, data: { runtimeJson: JSON.stringify(updated) } });
+  1005→        return updated;
+  1006→      }
+  1007→      return { ...state, healthy };
+  1008→    }
+  1009→  }
+  1010→
+  1011→  // Not served by THIS process — maybe another worker/instance already serves it.
+  1012→  const stored = await readRuntimeState(svc.id);
+  1013→  if (stored) {
+  1014→    const healthy = await isHealthy(stored.port);
+  1015→    if (healthy) {
+  1016→      if (!stored.healthy) {
+  1017→        const updated = { ...stored, healthy: true };
+  1018→        await db.service.update({ where: { id: svc.id }, data: { runtimeJson: JSON.stringify(updated) } });
+  1019→        return updated;
+  1020→      }
+  1021→      return { ...stored, healthy: true };
+  1022→    }
+  1023→  }
+  1024→
+  1025→  const fresh = await startRuntime(svc);
+  1026→  return fresh;
+  1027→}
+  1028→
+  1029→type ReconcileGlobal = typeof globalThis & { __hosterReconcile?: { busy: boolean; lastRun: number } };
+  1030→const rg = globalThis as ReconcileGlobal;
+  1031→
+  1032→/** Reconciles all services (started missing runners, stops orphans). Cheap to call often. */
+  1033→export async function reconcileRuntimes(): Promise<void> {
+  1034→  rg.__hosterReconcile ??= { busy: false, lastRun: 0 };
+  1035→  const rec = rg.__hosterReconcile;
+  1036→  if (rec.busy || Date.now() - rec.lastRun < 2_000) return;
+  1037→  rec.busy = true;
+  1038→  try {
+  1039→    const rows = await db.service.findMany({
+  1040→      where: { OR: [{ status: 'running' }, { runtimeJson: { not: null } }] },
+  1041→    });
+  1042→    for (const row of rows) {
+  1043→      try {
+  1044→        await ensureRuntime(row);
+  1045→      } catch (err) {
+  1046→        console.error(`[runtime] reconcile failed for ${row.name}`, err);
+  1047→      }
+  1048→    }
+  1049→  } finally {
+  1050→    rec.busy = false;
+  1051→    rec.lastRun = Date.now();
+  1052→  }
+  1053→}
+  1054→

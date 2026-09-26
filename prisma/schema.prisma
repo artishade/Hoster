@@ -1,0 +1,212 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Hosting Services (API / MCP / Plugin workloads) ─────────────────────────
+
+model Service {
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  description        String   @default("")
+  type               String   @default("api") // api | mcp | plugin
+  status             String   @default("building") // running | deploying | building | stopped | failed
+  repoUrl            String   @default("")
+  branch             String   @default("main")
+  commitHash         String   @default("")
+  commitMessage      String   @default("")
+  url                String   @default("")
+  hardwareTier       String   @default("cpu-nano")
+  region             String   @default("us-east-va (N. Virginia)")
+  instancesJson      String   @default("{}")
+  metricsJson        String   @default("{}")
+  buildCommand       String   @default("")
+  startCommand       String   @default("")
+  port               Int      @default(8080)
+  protocol           String   @default("http") // http | sse | stdio-proxy | websocket
+  envVarsJson        String   @default("[]")
+  customDomainsJson  String   @default("[]")
+  attachedPostgresId String?
+  attachedRedisId    String?
+  volumeMountsJson   String   @default("[]")
+  s3BucketId         String?
+  mcpDetailsJson     String?
+  pluginDetailsJson  String?
+  runtimeJson        String?  // live runner state: { pid, port, startedAt, mode, healthy }
+  lifecycleStartedAt DateTime @default(now()) // state machine anchor for building→deploying→running
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  logs LogEntry[]
+  data ServiceData[]
+}
+
+// Persistent key/value store for deployed services — the builtin runner's
+// /api/kv endpoints read & write here, giving every deployed project real,
+// restart-surviving server-side state.
+model ServiceData {
+  id        String   @id @default(cuid())
+  serviceId String
+  key       String
+  valueJson String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([serviceId, key])
+  @@index([serviceId])
+}
+
+// ─── Databases & Cache ───────────────────────────────────────────────────────
+
+model PostgresDb {
+  id                     String   @id @default(cuid())
+  name                   String   @unique
+  version                String   @default("16.4")
+  region                 String   @default("us-east-va (N. Virginia)")
+  status                 String   @default("provisioning") // available | provisioning | maintenance | stopped
+  storageGb              Float    @default(1)
+  usedStorageGb          Float    @default(0)
+  pgvectorEnabled        Boolean  @default(false)
+  connectionString       String   @default("")
+  pooledConnectionString String   @default("")
+  activeConnections      Int      @default(0)
+  maxConnections         Int      @default(100)
+  cpuPercent             Float    @default(0)
+  memoryMb               Float    @default(0)
+  lifecycleStartedAt     DateTime @default(now())
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+}
+
+model RedisDb {
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  version            String   @default("7.4")
+  region             String   @default("us-east-va (N. Virginia)")
+  status             String   @default("provisioning") // available | provisioning | stopped
+  memoryLimitMb      Float    @default(25)
+  usedMemoryMb       Float    @default(0)
+  evictionPolicy     String   @default("allkeys-lru")
+  connectionString   String   @default("")
+  connectedClients   Int      @default(0)
+  hitRatePercent     Float    @default(0)
+  opsPerSec          Int      @default(0)
+  lifecycleStartedAt DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+// ─── Storage ─────────────────────────────────────────────────────────────────
+
+model Volume {
+  id                   String   @id @default(cuid())
+  name                 String   @unique
+  mountPath            String // e.g. /models or /data
+  sizeGb               Float
+  usedGb               Float    @default(0)
+  type                 String   @default("nvme-ssd") // nvme-ssd | gp3-ssd
+  attachedToServiceId  String?
+  lifecycleStartedAt   DateTime @default(now())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model Bucket {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  provider     String   @default("built-in-storage") // aws-s3 | cloudflare-r2 | minio | built-in-storage
+  bucketName   String
+  region       String   @default("auto")
+  endpointUrl  String?
+  accessKeyId  String   @default("")
+  isPublic     Boolean  @default(false)
+  totalObjects Int      @default(0)
+  totalSizeMb  Float    @default(0)
+  status       String   @default("connected") // connected | error
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Domain {
+  id            String   @id @default(cuid())
+  serviceId     String
+  serviceName   String
+  domain        String   @unique
+  cnameTarget   String   @default("edge.nexushost.dev")
+  sslStatus     String   @default("pending") // active | pending | failed
+  dnsConfigured Boolean  @default(false)
+  checkCount    Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ─── Compute Providers (built-in free + custom, managed in Dashboard Settings) ──
+
+model Provider {
+  id               String    @id @default(cuid())
+  slug             String    @unique // 'local-node' | 'huggingface' | 'render' | 'fly' | 'koyeb' | custom-xxx
+  name             String
+  type             String // local | huggingface | render | fly | koyeb | runpod | custom_agent | custom_probe
+  category         String    @default("custom_server") // free_cloud | local_node | custom_server | gpu_cloud
+  status           String    @default("disconnected") // connected | disconnected | connecting | error | needs_auth
+  token            String? // provider API token (base64-obfuscated at rest)
+  endpointUrl      String?
+  accountEmail     String?
+  accountPlan      String?
+  accountInfoJson  String?
+  lastCheckedAt    DateTime?
+  pingLatencyMs    Int?
+  capacityJson     String    @default("{}") // { vCpu, ramGb, gpuModel?, vramGb?, storageGb }
+  allocatedJson    String    @default("{}") // { vCpu, ramGb, vramGb?, servicesCount }
+  featuresJson     String    @default("[]")
+  isBuiltIn        Boolean   @default(false)
+  isFree           Boolean   @default(true)
+  liveMetricsJson  String? // live telemetry for custom_agent nodes
+  tagsJson         String    @default("[]")
+  notes            String?
+  osInfo           String?   // reported by node agent (uname -srm)
+  agentToken       String?   @unique // heartbeat auth for custom_agent nodes
+  lastHeartbeatAt  DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
+
+// ─── Metrics history (host + services) ───────────────────────────────────────
+
+model MetricSample {
+  id          Int      @id @default(autoincrement())
+  scope       String   @default("host") // host | service
+  scopeId     String   @default("host") // 'host' or service id
+  timestamp   DateTime @default(now())
+  cpuPercent  Float
+  ramUsedGb   Float
+  ramTotalGb  Float
+  diskUsedGb  Float
+  diskTotalGb Float
+  netInMb     Float?
+  netOutMb    Float?
+  extraJson   String? // gpu, load, latency etc.
+}
+
+// ─── Activity & system logs ──────────────────────────────────────────────────
+
+model LogEntry {
+  id        String   @id @default(cuid())
+  serviceId String?
+  scope     String   @default("system") // system | service | database | storage | domain | provider | deploy
+  level     String   @default("info") // info | warn | error | debug
+  message   String
+  source    String?
+  createdAt DateTime @default(now())
+
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([scope, createdAt])
+  @@index([serviceId, createdAt])
+}
