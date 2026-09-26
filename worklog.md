@@ -108,3 +108,35 @@ Stage Summary:
 - New user-facing surface: Activity feed (global real event stream), measured tier specs, latency trend analytics on the edge view, process-identity badges everywhere.
 - Bugs fixed this round: EPIPE app crashes on server restart, collateral process-group kills, BigInt SQL serialization (prior round), stale tier display.
 - Recommended next phase: deploy webhooks (GitHub push → redeploy), per-service log file browser UI (app.log history beyond the DB buffer), real TLS via Caddy, python venv isolation, autoscaling from real load.
+
+---
+Task ID: review-round-3 (cron webDevReview)
+Agent: main agent (Z.ai Code)
+Task: Assess project status, QA via agent-browser, fix bugs, add features (deploy webhooks, log file browser) + styling polish, continue development
+
+Work Log:
+- QA via agent-browser across all views (dashboard, services, service detail, edge, activity, databases, providers, settings): zero console errors, zero page errors, mobile 375px no horizontal overflow. VLM screenshot reviews used to catch visual issues.
+- SECURITY FIX (found during QA): /api/providers serialized the RAW provider token in `record.token` (e.g. the HuggingFace token was readable by any API client). Fixed in serializeProvider — now only `hasToken` + `tokenLast4` are exposed; verify/re-verify paths read the real token from the DB server-side. Verified: raw token no longer present in the API response.
+- INFRA FIX (dev-server stability): the control plane kept dying — root-caused TWO causes: (1) OOM kill (npx tsc 1.7GB + next-server 2.1GB + chrome exceeded 4GB) — fixed by closing browser sessions before heavy tooling; (2) the sandbox gateway reaps background processes spawned by tool calls when the call ends — fixed by starting the dev server as a double-fork daemon (python os.fork + setsid + fork, PPID 1, own session). Server now survives across tool calls indefinitely.
+- BUG FIX (stuck deployments): services interrupted mid-pipeline by a control-plane crash stayed in building/deploying FOREVER (watchdog only recovered 'running' services — live evidence: 'nova' stuck 30+ min). Extended the deploy watchdog with stuck-deployment recovery: >180s old + no active pipeline in-process → relaunch the REAL pipeline (bounded by the self-heal budget); builtin runners flip to failed and reconcile. Verified live: nova was detected, pipeline relaunched (git clone + bun install + spawn), app failed its real HTTP readiness probe (that repo genuinely doesn't bind the port) → marked failed with the REAL error in logs. No more infinite stuck states.
+- NEW FEATURE — Deploy Webhooks (push-to-deploy, fully real):
+  * Schema: Service.webhookSecret (unique) + WebhookDelivery model (event, repo, branch, sender, commitSha, result, detail) + indexes; db:push applied; secrets seeded for all existing services; lazy migration on list GET + creation-time generation.
+  * src/lib/hoster/webhooks.ts: HMAC-SHA256 verification (timing-safe, x-hub-signature-256), repo-URL normalization matching (protocol/.git/auth-insensitive), constant-time generic-token compare, triggerRedeploy (kills old tree → full git clone → build → run pipeline), delivery recording.
+  * POST /api/webhooks/github: GitHub-compatible receiver — ping answered, push events matched by repo URL, per-service signature verification, branch filter, in-progress guard, per-service accept/skip/reject results, 202 when deployed.
+  * POST /api/webhooks/deploy: generic CI trigger (query param, JSON body, or Bearer auth) for GitLab/Gitea/scripts/cron.
+  * GET /api/webhooks/deliveries: real delivery history (per-service or global).
+  * PATCH action 'rotate-webhook' on /api/services/[id]: regenerates the secret.
+  * E2E VERIFIED with simulated GitHub push: valid HMAC + matching branch → 202 accepted → full pipeline re-ran (fresh pid, running, commit extracted); bad signature → rejected; branch mismatch → skipped (real-node-app watches master, push to main correctly skipped); ping → pong; generic curl + Bearer both trigger; deliveries recorded with correct results.
+- NEW FEATURE — Log File Browser (full app.log history):
+  * GET /api/services/[id]/log-file: real on-disk app.log reader — ?tail=N (default 300, max 5000), 16MB in-memory window cap with truncation flag, size/line-count/mtime metadata, ?download=1 streams the whole file as attachment.
+  * ServiceDetailView logs tab gained a mode toggle: LIVE STREAM (buffered DB view) ↔ FILE HISTORY (app.log) — terminal-style window with macOS dots + file path, sticky left-pinned line numbers, newest-first, error/warn line highlighting, Load older (×3 up to 5000), Download full log, copy tail, mtime + refresh + live poll every 5s. Long lines now scroll horizontally (no more broken wrapping), per VLM QA feedback.
+- NEW UI TAB — 'Deploy Webhooks' in ServiceDetailView: webhook endpoint (origin-based, copy), masked secret with reveal/copy/rotate + tooltip hint, GitHub 4-step setup card, generic-CI curl example (with Bearer note), REAL delivery history with result filter chips (all/accepted/skipped/rejected with counts), builtin-runner notice when no repo. Verified live with real delivery rows from the E2E tests.
+- Styling polish: nx-status-dot pulse-ring animation (running=emerald, building=amber, failed=red, stopped=grey) on service cards; amber shimmer strip on building/deploying cards; nx-card-lift hover elevation; tabular-nums metric typography (bolder values vs labels); unified sidebar badges (numeric count vs text vs LIVE emerald pulse variants); custom-scrollbar class in globals.css.
+- Verified: eslint clean, tsc clean (app code), all API endpoints 200, ingress for all running services 200, browser QA of every new surface, mobile no-overflow.
+
+Stage Summary:
+- Security: provider tokens no longer leak through the providers API (was a real vulnerability found by QA).
+- Platform resilience: crash-interrupted deployments now self-recover via the watchdog (previously stuck forever); the dev server itself is now a stable double-fork daemon surviving sandbox session reaping.
+- New capability: real push-to-deploy webhooks (GitHub HMAC + generic CI token auth) with delivery history — the #1 recommended next feature from the previous round — verified end-to-end with a simulated signed GitHub push triggering a full real redeploy.
+- New capability: complete on-disk log history browser beyond the rate-limited DB buffer, with download.
+- Recommended next phase: real TLS via Caddy for the edge host-routing path, python venv/uv isolation for ML repos, autoscaling from real load, per-service terminal (PTY exec), global delivery-history view in the Activity feed (currently per-service in the webhooks tab).

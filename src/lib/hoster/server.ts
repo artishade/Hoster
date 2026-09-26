@@ -27,7 +27,8 @@ type PrismaService = {
   instancesJson: string; metricsJson: string; buildCommand: string; startCommand: string; port: number;
   protocol: string; envVarsJson: string; customDomainsJson: string; attachedPostgresId: string | null;
   attachedRedisId: string | null; volumeMountsJson: string; s3BucketId: string | null; mcpDetailsJson: string | null;
-  pluginDetailsJson: string | null; runtimeJson?: string | null; lifecycleStartedAt: Date; createdAt: Date; updatedAt: Date;
+  pluginDetailsJson: string | null; runtimeJson?: string | null; webhookSecret?: string | null;
+  lifecycleStartedAt: Date; createdAt: Date; updatedAt: Date;
 };
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
@@ -159,6 +160,7 @@ export function serializeService(
     startCommand: row.startCommand,
     port: row.port,
     protocol: row.protocol as Service['protocol'],
+    webhookSecret: row.webhookSecret ?? undefined,
     envVars: safeParse(row.envVarsJson, []),
     customDomains: safeParse(row.customDomainsJson, []),
     attachedPostgresId: row.attachedPostgresId ?? undefined,
@@ -282,7 +284,7 @@ export function serializeProvider(row: {
   endpointUrl: string | null; accountEmail: string | null; accountPlan: string | null; accountInfoJson: string | null;
   lastCheckedAt: Date | null; pingLatencyMs: number | null; capacityJson: string; allocatedJson: string;
   featuresJson: string; isBuiltIn: boolean; isFree: boolean; notes: string | null; tagsJson: string;
-}): ConnectedProvider & { record: { token: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean } } {
+}): ConnectedProvider & { record: { hasToken: boolean; tokenLast4: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean } } {
   return {
     id: row.id,
     name: row.name,
@@ -300,7 +302,15 @@ export function serializeProvider(row: {
     features: safeParse(row.featuresJson, []),
     isBuiltInFree: row.isBuiltIn && row.isFree,
     notes: row.notes ?? undefined,
-    record: { token: row.token, endpointUrl: row.endpointUrl, slug: row.slug, isBuiltIn: row.isBuiltIn },
+    // SECURITY: never serialize the raw token — only presence + last 4 chars
+    // (verify/re-verify paths read the real token from the DB server-side).
+    record: {
+      hasToken: Boolean(row.token),
+      tokenLast4: row.token ? row.token.slice(-4) : null,
+      endpointUrl: row.endpointUrl,
+      slug: row.slug,
+      isBuiltIn: row.isBuiltIn,
+    },
   };
 }
 

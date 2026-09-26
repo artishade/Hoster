@@ -12,6 +12,7 @@ import {
   tierSpec,
 } from '@/lib/hoster/server';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from '@/lib/hoster/hardware-specs';
+import { generateWebhookSecret } from '@/lib/hoster/webhooks';
 import type { Service } from '@/lib/hoster/types';
 
 export const dynamic = 'force-dynamic';
@@ -109,6 +110,16 @@ export async function GET() {
       const life = await advanceServiceLifecycle(row);
       data.push(serializeService(row, host, { statusOverride: life.status }));
     }
+    // Lazy webhook-secret migration: any legacy service still missing a
+    // deploy-webhook secret gets one (single write per service, then never).
+    const missing = rows.filter((r) => !r.webhookSecret);
+    if (missing.length) {
+      void (async () => {
+        for (const m of missing) {
+          await db.service.update({ where: { id: m.id }, data: { webhookSecret: generateWebhookSecret() } }).catch(() => {});
+        }
+      })();
+    }
     void recomputeAllocations().catch(() => {});
     return NextResponse.json({ data });
   } catch (err) {
@@ -205,6 +216,7 @@ export async function POST(req: NextRequest) {
         s3BucketId: typeof body.s3BucketId === 'string' && body.s3BucketId ? body.s3BucketId : null,
         mcpDetailsJson: body.mcpDetails && typeof body.mcpDetails === 'object' ? JSON.stringify(body.mcpDetails) : null,
         pluginDetailsJson: body.pluginDetails && typeof body.pluginDetails === 'object' ? JSON.stringify(body.pluginDetails) : null,
+        webhookSecret: generateWebhookSecret(),
         lifecycleStartedAt: new Date(),
       },
     });

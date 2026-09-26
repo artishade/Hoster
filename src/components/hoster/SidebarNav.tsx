@@ -64,60 +64,70 @@ export default function SidebarNav({
       label: 'Nodes & Free Providers',
       icon: Layers,
       badge: 'Live Pool',
+      badgeKind: 'text' as const,
     },
     {
       id: 'services',
       label: 'Services & Hosting',
       icon: Server,
       badge: serviceCounts.total.toString(),
+      badgeKind: 'count' as const,
     },
     {
       id: 'databases',
       label: 'Databases & Cache',
       icon: Database,
       badge: `${dbCounts.postgres + dbCounts.redis}`,
+      badgeKind: 'count' as const,
     },
     {
       id: 'storage',
       label: 'Storage & Volumes',
       icon: HardDrive,
       badge: String(storageCount ?? 0),
+      badgeKind: 'count' as const,
     },
     {
       id: 'domains',
       label: 'Custom Domains',
       icon: Globe,
       badge: 'SSL',
+      badgeKind: 'text' as const,
     },
     {
       id: 'edge',
       label: 'Edge Network',
       icon: Network,
       badge: 'PoP',
+      badgeKind: 'text' as const,
     },
     {
       id: 'activity',
       label: 'Activity & Events',
       icon: Radio,
       badge: 'LIVE',
+      badgeKind: 'live' as const,
     },
     {
       id: 'mcp-inspector',
       label: 'MCP & Plugin Studio',
       icon: Terminal,
       badge: 'JSON-RPC',
+      badgeKind: 'text' as const,
     },
     {
       id: 'advisor',
       label: 'AI Hardware Sizer',
       icon: Sparkles,
       badge: 'AI',
+      badgeKind: 'text' as const,
     },
     {
       id: 'settings',
       label: 'Dashboard Settings',
       icon: Settings,
       badge: '',
+      badgeKind: 'text' as const,
     },
   ];
 
@@ -154,12 +164,23 @@ export default function SidebarNav({
                   </div>
                   {item.badge && (
                     <span
-                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
-                        isActive
-                          ? 'bg-cyan-950 text-cyan-300 border border-cyan-800/60'
-                          : 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 border ${
+                        item.badgeKind === 'live'
+                          ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800/60 flex items-center gap-1'
+                          : item.badgeKind === 'count'
+                          ? 'nx-metric-value font-semibold '
+                          : ''
+                      } ${
+                        item.badgeKind === 'live'
+                          ? ''
+                          : isActive
+                          ? 'bg-cyan-950 text-cyan-300 border-cyan-800/60'
+                          : 'bg-zinc-900 text-zinc-400 border-zinc-800'
                       }`}
                     >
+                      {item.badgeKind === 'live' && (
+                        <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse" aria-hidden />
+                      )}
                       {item.badge}
                     </span>
                   )}

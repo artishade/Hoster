@@ -937,6 +937,44 @@ export function ensureDeployWatchdog(): void {
           /* transient */
         }
       }
+
+      // ── stuck-deployment recovery ─────────────────────────────────────
+      // A control-plane crash mid-pipeline leaves services in building/
+      // deploying forever (the pipeline steps died with the server, and
+      // nothing re-triggers them). If no pipeline is active in THIS process
+      // and the state is older than STUCK_DEPLOY_SEC, relaunch it for real
+      // (bounded by the self-heal budget). Builtin runners just flip to
+      // failed — ensureRuntime reconciles them back on the next sweep.
+      const STUCK_DEPLOY_SEC = 180;
+      const stuck = await db.service.findMany({
+        where: { status: { in: ['building', 'deploying'] } },
+      });
+      for (const row of stuck) {
+        if (busy.has(row.id) || deploys.has(row.id)) continue; // active here
+        const ageSec = (Date.now() - new Date(row.lifecycleStartedAt).getTime()) / 1000;
+        if (ageSec < STUCK_DEPLOY_SEC) continue; // still within a plausible pipeline run
+        if (!row.repoUrl) {
+          await dlog(
+            row.id,
+            `Watchdog: builtin service stuck in "${row.status}" for ${Math.round(ageSec / 60)}min with no active pipeline (interrupted deployment) — marking failed; the runtime reconciler will boot a fresh runner.`,
+            'warn'
+          );
+          await setStatus(row.id, 'failed');
+          continue;
+        }
+        if (!maySelfHeal(row.id)) {
+          await dlog(row.id, `Watchdog: deployment stuck in "${row.status}" for ${Math.round(ageSec / 60)}min — self-heal budget exhausted, marking failed.`, 'error');
+          await setStatus(row.id, 'failed');
+          continue;
+        }
+        await dlog(
+          row.id,
+          `Watchdog: deployment stuck in "${row.status}" for ${Math.round(ageSec / 60)}min with no active pipeline (interrupted by a control-plane restart) — RELAUNCHING the real git clone → build → run pipeline.`,
+          'warn'
+        );
+        await setStatus(row.id, 'building', { lifecycleStartedAt: new Date() });
+        void startDeployment(row).catch(() => {});
+      }
     } catch (err) {
       console.error('[deployer] watchdog tick failed', err);
     } finally {

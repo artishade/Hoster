@@ -5,6 +5,7 @@ import { stopRuntime, ensureRuntime } from '@/lib/hoster/runtime';
 import { startDeployment, stopDeployment } from '@/lib/hoster/deployer';
 import { addLog, advanceServiceLifecycle, recomputeAllocations, serializeService } from '@/lib/hoster/server';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from '@/lib/hoster/hardware-specs';
+import { generateWebhookSecret, ensureWebhookSecret } from '@/lib/hoster/webhooks';
 
 export const dynamic = 'force-dynamic';
 
@@ -60,6 +61,12 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     const row = await db.service.findUnique({ where: { id } });
     if (!row) return NextResponse.json({ error: 'Service not found' }, { status: 404 });
 
+    // Lazy-migrate: every service gets a webhook secret (webhook feature).
+    if (!row.webhookSecret) {
+      const secret = await ensureWebhookSecret(id);
+      row.webhookSecret = secret;
+    }
+
     const life = await advanceServiceLifecycle(row);
     const host = await getHostMetrics();
     return NextResponse.json({ data: serializeService(row, host, { statusOverride: life.status }) });
@@ -95,6 +102,23 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     } = {};
 
     const action = typeof body.action === 'string' ? body.action : undefined;
+    if (action === 'rotate-webhook') {
+      const secret = generateWebhookSecret();
+      await db.service.update({ where: { id }, data: { webhookSecret: secret } });
+      await addLog({
+        serviceId: id,
+        scope: 'deploy',
+        message: `Webhook secret rotated for "${row.name}" — GitHub must be updated with the new secret before the next push.`,
+        source: 'webhook',
+      });
+      const fresh = await db.service.findUnique({ where: { id } });
+      if (fresh) {
+        const life = await advanceServiceLifecycle(fresh);
+        const host = await getHostMetrics();
+        return NextResponse.json({ data: serializeService(fresh, host, { statusOverride: life.status }) });
+      }
+      return NextResponse.json({ error: 'Service not found after rotation' }, { status: 404 });
+    }
     if (action === 'stop') {
       data.status = 'stopped';
       // persist the state flip FIRST so the old process's exit handler sees
@@ -111,7 +135,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       await stopDeployment(row);
       await stopRuntime(row);
     } else if (action) {
-      return NextResponse.json({ error: `Invalid action "${action}" (expected start, stop or restart)` }, { status: 400 });
+      return NextResponse.json({ error: `Invalid action "${action}" (expected start, stop, restart or rotate-webhook)` }, { status: 400 });
     }
 
     if (body.description !== undefined) data.description = String(body.description);

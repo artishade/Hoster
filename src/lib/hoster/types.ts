@@ -284,6 +284,8 @@ export interface Service {
   startCommand: string;
   port: number;
   protocol: 'http' | 'sse' | 'stdio-proxy' | 'websocket';
+  /** Per-service deploy-webhook secret (HMAC for GitHub push, bearer for generic CI). */
+  webhookSecret?: string;
   envVars: EnvVariable[];
   customDomains: string[];
   attachedPostgresId?: string;
@@ -347,7 +349,7 @@ export interface RedisDatabase {
 // ─── Shared action/payload contracts (page ⇄ views) ─────────────────────────
 
 export type SettingsViewProvider = ConnectedProvider & {
-  record?: { token: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean };
+  record?: { hasToken: boolean; tokenLast4: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean };
 };
 
 export interface NewProviderPayload {

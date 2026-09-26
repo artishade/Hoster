@@ -41,7 +41,7 @@ export interface NewProviderPayload {
 }
 
 export type SettingsViewProvider = ConnectedProvider & {
-  record?: { token: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean };
+  record?: { hasToken: boolean; tokenLast4: string | null; endpointUrl: string | null; slug: string; isBuiltIn: boolean };
 };
 
 interface SettingsViewProps {

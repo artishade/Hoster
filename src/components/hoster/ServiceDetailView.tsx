@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Service, 
   LogEntry, 
@@ -36,8 +36,44 @@ import { Server,
   ArrowLeft,
   Sparkles,
   Search,
-  Code
+  Code,
+  Webhook,
+  RotateCw,
+  FileText,
+  History
 } from 'lucide-react';
+
+/** On-disk app.log metadata + tail lines (complete stdout+stderr record). */
+interface LogFileData {
+  exists: boolean;
+  lines: string[];
+  sizeBytes: number;
+  sizeMb?: number;
+  truncated?: boolean;
+  truncatedBytes?: number;
+  totalLinesInWindow?: number;
+  firstLineIndex?: number;
+  requestedTail: number;
+  showingLines?: number;
+  modifiedAt?: string;
+  message?: string;
+}
+
+/** One REAL webhook delivery (GitHub push / generic CI trigger) row. */
+interface WebhookDeliveryRow {
+  id: string;
+  serviceId: string | null;
+  serviceName: string | null;
+  source: string;
+  event: string;
+  repo: string;
+  branch: string;
+  sender: string;
+  commitSha: string;
+  result: string;
+  detail: string;
+  createdAt: string;
+}
 
 interface ServiceDetailViewProps {
   service: Service;
@@ -64,7 +100,7 @@ export default function ServiceDetailView({
   onRestartService,
   onDeleteService,
 }: ServiceDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
   
   // Hardware Spec
   const spec = HARDWARE_SPECS[service.hardwareTier] || HARDWARE_SPECS['cpu-standard'];
@@ -78,6 +114,23 @@ export default function ServiceDetailView({
   const [logSearch, setLogSearch] = useState('');
   const [isStreamingLogs, setIsStreamingLogs] = useState(true);
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  // Log file history state (the full on-disk app.log — beyond the DB buffer)
+  const [logMode, setLogMode] = useState<'stream' | 'file'>('stream');
+  const [fileLog, setFileLog] = useState<LogFileData | null>(null);
+  const [fileLogTail, setFileLogTail] = useState(300);
+  const [fileLogLoading, setFileLogLoading] = useState(false);
+
+  // Webhook state (REAL delivery history from the control plane)
+  const [deliveries, setDeliveries] = useState<WebhookDeliveryRow[]>([]);
+  const [deliveryFilter, setDeliveryFilter] = useState<'all' | 'accepted' | 'skipped' | 'rejected'>('all');
+  const [webhookSecretRevealed, setWebhookSecretRevealed] = useState(false);
+  const [isRotatingSecret, setIsRotatingSecret] = useState(false);
+  const [origin, setOrigin] = useState('');
+  useEffect(() => setOrigin(window.location.origin), []);
+
+  const filteredDeliveries =
+    deliveryFilter === 'all' ? deliveries : deliveries.filter((d) => d.result === deliveryFilter);
 
   // MCP Tester State
   const [selectedToolIndex, setSelectedToolIndex] = useState(0);
@@ -131,6 +184,71 @@ export default function ServiceDetailView({
       clearInterval(interval);
     };
   }, [service.id, isStreamingLogs]);
+
+  // File-history mode: read the REAL on-disk app.log (unbounded, beyond the
+  // rate-limited DB buffer). Refetch when the mode/tail changes, then poll
+  // slowly while active so freshly written lines show up.
+  const fetchFileLog = useCallback(async () => {
+    setFileLogLoading(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}/log-file?tail=${fileLogTail}`);
+      const json = await res.json();
+      if (json?.data) setFileLog(json.data as LogFileData);
+    } catch {
+      /* transient — next poll retries */
+    } finally {
+      setFileLogLoading(false);
+    }
+  }, [service.id, fileLogTail]);
+
+  useEffect(() => {
+    if (logMode !== 'file') return;
+    void fetchFileLog();
+    const interval = setInterval(() => void fetchFileLog(), 5000);
+    return () => clearInterval(interval);
+  }, [logMode, fetchFileLog]);
+
+  // Webhook deliveries — REAL history from the control plane (poll while the tab is open).
+  useEffect(() => {
+    if (activeTab !== 'webhooks') return;
+    let cancelled = false;
+    const fetchDeliveries = async () => {
+      try {
+        const res = await fetch(`/api/webhooks/deliveries?serviceId=${service.id}&limit=50`);
+        const json = await res.json();
+        if (!cancelled && json?.data) setDeliveries(json.data as WebhookDeliveryRow[]);
+      } catch {
+        /* transient */
+      }
+    };
+    void fetchDeliveries();
+    const interval = setInterval(fetchDeliveries, 6000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeTab, service.id]);
+
+  // Rotate the webhook secret (regenerates + returns the updated service).
+  const handleRotateWebhookSecret = async () => {
+    setIsRotatingSecret(true);
+    try {
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'rotate-webhook' }),
+      });
+      const json = await res.json();
+      if (json?.data) {
+        onUpdateService(json.data as Service);
+        setWebhookSecretRevealed(true);
+      }
+    } catch {
+      /* surfaced by missing update */
+    } finally {
+      setIsRotatingSecret(false);
+    }
+  };
 
   // Execute MCP tool via the platform runtime (LLM-backed tool execution API)
   const handleExecuteTool = async () => {
@@ -426,6 +544,7 @@ export default function ServiceDetailView({
         {[
           { id: 'overview', label: 'Metrics & Health', icon: Activity },
           { id: 'logs', label: 'Live Logs Terminal', icon: Terminal },
+          { id: 'webhooks', label: 'Deploy Webhooks', icon: Webhook },
           ...(isMcp || isPlugin ? [{ id: 'mcp', label: 'MCP & Plugin Studio', icon: Code }] : []),
           { id: 'hardware', label: 'Hardware & GPU Scaling', icon: Cpu },
           { id: 'env', label: 'Environment & Secrets', icon: Key },
@@ -437,7 +556,7 @@ export default function ServiceDetailView({
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
+              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
               className={`flex items-center gap-2 px-4 py-2.5 border-b-2 whitespace-nowrap transition ${
                 isActive
                   ? 'border-cyan-400 text-cyan-300 bg-cyan-950/20'
@@ -613,7 +732,71 @@ export default function ServiceDetailView({
       {/* TAB 2: LIVE LOGS TERMINAL */}
       {activeTab === 'logs' && (
         <div className="space-y-4">
-          {/* Controls Bar */}
+          {/* Mode toggle: live DB stream ↔ full on-disk file history */}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-900/60 border border-zinc-800">
+              <button
+                onClick={() => setLogMode('stream')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-mono transition ${
+                  logMode === 'stream'
+                    ? 'bg-zinc-800 text-cyan-300 shadow-inner'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <Terminal className="w-3.5 h-3.5" />
+                <span>LIVE STREAM</span>
+                <span className="text-zinc-600">(buffered)</span>
+              </button>
+              <button
+                onClick={() => setLogMode('file')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-mono transition ${
+                  logMode === 'file'
+                    ? 'bg-zinc-800 text-purple-300 shadow-inner'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>FILE HISTORY</span>
+                <span className="text-zinc-600">(app.log)</span>
+              </button>
+            </div>
+
+            {logMode === 'file' && fileLog && fileLog.exists && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 text-[10px] font-mono text-zinc-400">
+                  {fileLog.sizeMb !== undefined ? `${fileLog.sizeMb} MB` : `${(fileLog.sizeBytes / 1024).toFixed(1)} KB`} on disk
+                </span>
+                <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 text-[10px] font-mono text-zinc-400">
+                  {fileLog.showingLines ?? fileLog.lines.length} / {fileLog.totalLinesInWindow ?? '?'} lines
+                </span>
+                {fileLog.truncated && (
+                  <span
+                    className="px-2 py-1 rounded bg-amber-950/40 border border-amber-800/50 text-[10px] font-mono text-amber-400"
+                    title={`File exceeds 16 MB — showing the last 16 MB (${Math.round((fileLog.truncatedBytes ?? 0) / 1048576)} MB skipped). Download for the full log.`}
+                  >
+                    window capped @ 16 MB
+                  </span>
+                )}
+                <button
+                  onClick={() => setFileLogTail((t) => Math.min(t * 3, 5000))}
+                  disabled={fileLogLoading || fileLogTail >= 5000}
+                  className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[10px] font-mono uppercase disabled:opacity-40 transition"
+                >
+                  Load older ({Math.min(fileLogTail * 3, 5000)} lines)
+                </button>
+                <a
+                  href={`/api/services/${service.id}/log-file?download=1`}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-950/40 hover:bg-emerald-900/50 border border-emerald-800/50 text-emerald-300 text-[10px] font-mono uppercase transition"
+                >
+                  <Download className="w-3 h-3" />
+                  Download full log
+                </a>
+              </div>
+            )}
+          </div>
+
+          {/* Controls Bar (stream mode only) */}
+          {logMode === 'stream' && (
           <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-zinc-900/60 border border-zinc-800 text-xs">
             <div className="flex items-center gap-2">
               <span className="text-zinc-400 font-mono text-[11px]">Level:</span>
@@ -673,8 +856,10 @@ export default function ServiceDetailView({
               </button>
             </div>
           </div>
+          )}
 
-          {/* Terminal Console */}
+          {/* Terminal Console (live DB stream) */}
+          {logMode === 'stream' && (
           <div className="p-4 rounded-xl bg-black border border-zinc-800 font-mono text-xs text-zinc-300 h-96 overflow-y-auto space-y-1 shadow-2xl">
             {filteredLogs.length === 0 ? (
               <div className="text-zinc-600 text-center py-12">No logs match your filter criteria.</div>
@@ -703,6 +888,269 @@ export default function ServiceDetailView({
               ))
             )}
             <div ref={logsEndRef} />
+          </div>
+          )}
+
+          {/* File-history terminal (the complete on-disk app.log) */}
+          {logMode === 'file' && (
+            <div className="rounded-xl bg-black border border-zinc-800 shadow-2xl overflow-hidden">
+              <div className="flex items-center justify-between gap-2 px-4 py-2 border-b border-zinc-800 bg-zinc-950/80">
+                <div className="flex items-center gap-2 font-mono text-[11px]">
+                  <span className="flex gap-1.5 shrink-0">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500/70" />
+                    <span className="w-2.5 h-2.5 rounded-full bg-amber-500/70" />
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/70" />
+                  </span>
+                  <span className="text-zinc-400 truncate">deployments/{service.name}/app.log</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => void fetchFileLog()}
+                    disabled={fileLogLoading}
+                    className="p-1 rounded text-zinc-500 hover:text-zinc-300 transition disabled:opacity-40"
+                    title="Refresh now"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${fileLogLoading ? 'animate-spin' : ''}`} />
+                  </button>
+                  <button
+                    onClick={() =>
+                      fileLog &&
+                      copyToClipboard(
+                        fileLog.lines.slice().reverse().join('\n'),
+                        'file-logs'
+                      )
+                    }
+                    disabled={!fileLog || fileLog.lines.length === 0}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[10px] font-mono transition disabled:opacity-40"
+                  >
+                    {copiedText === 'file-logs' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>Copy tail</span>
+                  </button>
+                  {fileLog?.modifiedAt && (
+                    <span className="text-zinc-600 text-[10px] font-mono" title="Last write to app.log">
+                      mtime {new Date(fileLog.modifiedAt).toLocaleTimeString()}
+                    </span>
+                  )}
+                  <span className={`w-1.5 h-1.5 rounded-full ${fileLogLoading ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+                </div>
+              </div>
+              <div className="p-4 font-mono text-xs text-zinc-300 h-96 overflow-auto custom-scrollbar">
+                {!fileLog ? (
+                  <div className="text-zinc-600 text-center py-12">Reading app.log from disk…</div>
+                ) : !fileLog.exists ? (
+                  <div className="text-zinc-600 text-center py-12">{fileLog.message || 'No app.log on disk for this service yet.'}</div>
+                ) : fileLog.lines.length === 0 ? (
+                  <div className="text-zinc-600 text-center py-12">app.log exists but is empty.</div>
+                ) : (
+                  fileLog.lines
+                    .slice()
+                    .reverse()
+                    .map((line, i) => (
+                      <div
+                        key={`${fileLog.firstLineIndex ?? 0}-${i}`}
+                        className={`flex items-start gap-3 px-1 py-0.5 rounded leading-relaxed hover:bg-zinc-900/60 ${
+                          /\b(error|fatal|panic|uncaught)\b/i.test(line) ? 'text-red-300' : /\b(warn|warning|deprecated)\b/i.test(line) ? 'text-amber-300' : ''
+                        }`}
+                      >
+                        <span className="text-zinc-700 shrink-0 sticky left-0 bg-black pl-1 pr-1 select-none w-12 text-right">
+                          #{(fileLog.firstLineIndex ?? 0) + fileLog.lines.length - 1 - i}
+                        </span>
+                        <span className="text-zinc-300 whitespace-pre">{line}</span>
+                      </div>
+                    ))
+                )}
+              </div>
+              {fileLog?.exists && (
+                <div className="px-4 py-1.5 border-t border-zinc-800 bg-zinc-950/80 text-[10px] font-mono text-zinc-600">
+                  showing lines #{fileLog.firstLineIndex ?? 0}–#{(fileLog.firstLineIndex ?? 0) + (fileLog.showingLines ?? fileLog.lines.length) - 1} · newest first · long lines scroll horizontally · unfiltered process stdout+stderr
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2.5: DEPLOY WEBHOOKS (REAL push-to-deploy) */}
+      {activeTab === 'webhooks' && (
+        <div className="space-y-6">
+          {!service.repoUrl && (
+            <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-800/50 flex items-start gap-3">
+              <Zap className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-200/90 leading-relaxed">
+                This service runs the <strong>builtin runner</strong> (no git repository), so push-to-deploy does not apply.
+                Redeploy it manually with the Restart action, or re-create it with a repo URL to unlock webhooks.
+              </p>
+            </div>
+          )}
+
+          {/* Configuration card */}
+          <div className="p-5 rounded-2xl bg-zinc-900/60 border border-zinc-800 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Webhook className="w-4 h-4 text-cyan-400" />
+                <h3 className="text-xs font-bold text-zinc-200">Push-to-Deploy Webhook</h3>
+              </div>
+              <span className="text-[11px] font-mono text-zinc-500">HMAC-SHA256 verified</span>
+            </div>
+
+            {/* Webhook endpoint */}
+            <div className="space-y-1.5">
+              <span className="text-[11px] font-mono uppercase text-zinc-500">Webhook endpoint (GitHub)</span>
+              <div className="flex items-center gap-2 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800 font-mono text-xs">
+                <span className="text-emerald-400 font-bold shrink-0">POST</span>
+                <span className="text-zinc-200 truncate flex-1">{origin || '…'}/api/webhooks/github</span>
+                <button
+                  onClick={() => copyToClipboard(`${origin}/api/webhooks/github`, 'wh-url')}
+                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition shrink-0"
+                  title="Copy webhook URL"
+                >
+                  {copiedText === 'wh-url' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+              <p className="text-[11px] text-zinc-500">
+                Every push to <span className="text-cyan-300 font-mono">{service.repoUrl ? `${service.repoUrl.replace(/^https?:\/\//, '')} (branch ${service.branch})` : 'the tracked repo'}</span> re-runs the full git clone → build → run pipeline.
+              </p>
+            </div>
+
+            {/* Secret */}
+            <div className="space-y-1.5">
+              <span className="text-[11px] font-mono uppercase text-zinc-500">Webhook secret</span>
+              <div className="flex items-center gap-2 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800 font-mono text-xs">
+                <Lock className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                <span className="text-zinc-200 truncate flex-1" title={
+                  service.webhookSecret && !webhookSecretRevealed
+                    ? 'Middle characters hidden — click the eye to reveal the full secret'
+                    : 'The full webhook secret — use it as the GitHub webhook secret or CI bearer token'
+                }>
+                  {service.webhookSecret
+                    ? webhookSecretRevealed
+                      ? service.webhookSecret
+                      : `wh_${'•'.repeat(16)}${service.webhookSecret.slice(-4)}`
+                    : 'no secret yet'}
+                </span>
+                <button
+                  onClick={() => setWebhookSecretRevealed(!webhookSecretRevealed)}
+                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition shrink-0"
+                  title={webhookSecretRevealed ? 'Hide secret' : 'Reveal secret'}
+                >
+                  {webhookSecretRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  onClick={() => service.webhookSecret && copyToClipboard(service.webhookSecret, 'wh-secret')}
+                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition shrink-0 disabled:opacity-40"
+                  title="Copy secret"
+                  disabled={!service.webhookSecret}
+                >
+                  {copiedText === 'wh-secret' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  onClick={() => void handleRotateWebhookSecret()}
+                  disabled={isRotatingSecret}
+                  className="flex items-center gap-1 px-2 py-1 rounded bg-amber-950/50 hover:bg-amber-900/50 border border-amber-800/50 text-amber-300 text-[10px] font-mono uppercase transition shrink-0 disabled:opacity-50"
+                  title="Generate a new secret — update GitHub afterwards"
+                >
+                  <RotateCw className={`w-3 h-3 ${isRotatingSecret ? 'animate-spin' : ''}`} />
+                  Rotate
+                </button>
+              </div>
+            </div>
+
+            {/* GitHub setup steps */}
+            <div className="p-3.5 rounded-lg bg-zinc-950/60 border border-zinc-800/80 space-y-2">
+              <span className="text-[11px] font-mono uppercase text-zinc-500">GitHub setup — 4 steps</span>
+              <ol className="text-[11px] text-zinc-400 space-y-1.5 list-decimal list-inside leading-relaxed">
+                <li>Open your repository → <span className="text-zinc-200">Settings → Webhooks → Add webhook</span></li>
+                <li>Payload URL: <span className="text-cyan-300 font-mono break-all">{origin || '…'}/api/webhooks/github</span></li>
+                <li>Content type: <span className="text-zinc-200 font-mono">application/json</span> · Secret: the value above</li>
+                <li>Which events: <span className="text-zinc-200">Just the push event</span> — GitHub&apos;s ping is answered automatically</li>
+              </ol>
+            </div>
+
+            {/* Generic CI card */}
+            <div className="p-3.5 rounded-lg bg-zinc-950/60 border border-zinc-800/80 space-y-2">
+              <span className="text-[11px] font-mono uppercase text-zinc-500">Any other CI (GitLab, Gitea, scripts, cron)</span>
+              <div className="font-mono text-[11px] text-zinc-300 bg-black/60 rounded-lg p-2.5 border border-zinc-800/60 overflow-x-auto whitespace-nowrap">
+                <span className="text-emerald-400">curl</span> -X POST <span className="text-cyan-300">&quot;{origin || '…'}/api/webhooks/deploy?name={service.name}&amp;secret=&lt;secret&gt;&quot;</span>
+              </div>
+              <p className="text-[11px] text-zinc-500">Bearer token auth (<span className="font-mono">Authorization: Bearer &lt;secret&gt;</span>) works too.</p>
+            </div>
+          </div>
+
+          {/* Delivery history — REAL records */}
+          <div className="p-5 rounded-2xl bg-zinc-900/60 border border-zinc-800 space-y-3">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <History className="w-4 h-4 text-purple-400" />
+                <h3 className="text-xs font-bold text-zinc-200">Delivery history</h3>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {(['all', 'accepted', 'skipped', 'rejected'] as const).map((f) => (
+                  <button
+                    key={f}
+                    onClick={() => setDeliveryFilter(f)}
+                    className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase transition border ${
+                      deliveryFilter === f
+                        ? f === 'accepted'
+                          ? 'bg-emerald-950 text-emerald-300 border-emerald-800/60'
+                          : f === 'rejected'
+                          ? 'bg-red-950 text-red-300 border-red-800/60'
+                          : f === 'skipped'
+                          ? 'bg-zinc-800 text-zinc-300 border-zinc-700'
+                          : 'bg-cyan-950 text-cyan-300 border-cyan-800/60'
+                        : 'text-zinc-500 hover:text-zinc-300 border-zinc-800 bg-zinc-900'
+                    }`}
+                  >
+                    {f}
+                    {f !== 'all' && (
+                      <span className="ml-1 text-zinc-600">{deliveries.filter((d) => d.result === f).length}</span>
+                    )}
+                  </button>
+                ))}
+                <span className="text-[11px] font-mono text-zinc-500 ml-1">{deliveries.length} recent · live</span>
+              </div>
+            </div>
+
+            {deliveries.length === 0 ? (
+              <div className="text-center py-10 text-zinc-600 text-xs">
+                No webhook deliveries yet — push to the repo (or curl the CI endpoint) and it will appear here within seconds.
+              </div>
+            ) : filteredDeliveries.length === 0 ? (
+              <div className="text-center py-10 text-zinc-600 text-xs">No deliveries with result “{deliveryFilter}”.</div>
+            ) : (
+              <div className="max-h-96 overflow-y-auto space-y-1.5 pr-1 custom-scrollbar">
+                {filteredDeliveries.map((d) => (
+                  <div
+                    key={d.id}
+                    className="flex items-start gap-2.5 p-2.5 rounded-lg bg-zinc-950/70 border border-zinc-800/70 hover:border-zinc-700 transition"
+                  >
+                    <span
+                      className={`shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[9px] font-mono uppercase font-bold ${
+                        d.result === 'accepted'
+                          ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/50'
+                          : d.result === 'skipped'
+                          ? 'bg-zinc-900 text-zinc-400 border border-zinc-700'
+                          : d.result === 'rejected'
+                          ? 'bg-red-950 text-red-400 border border-red-800/50'
+                          : 'bg-amber-950 text-amber-400 border border-amber-800/50'
+                      }`}
+                    >
+                      {d.result}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap text-[11px] font-mono">
+                        <span className="text-cyan-400">{d.event}</span>
+                        <span className="text-zinc-500">{d.source}</span>
+                        {d.branch && <span className="text-zinc-400">@{d.branch}</span>}
+                        {d.commitSha && <span className="text-purple-400">{d.commitSha}</span>}
+                        {d.sender && <span className="text-zinc-500">by {d.sender}</span>}
+                        <span className="text-zinc-600 ml-auto">{new Date(d.createdAt).toLocaleTimeString()}</span>
+                      </div>
+                      {d.detail && <p className="text-[11px] text-zinc-500 mt-0.5 break-words">{d.detail}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

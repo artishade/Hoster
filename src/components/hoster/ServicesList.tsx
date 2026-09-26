@@ -173,8 +173,16 @@ export default function ServicesList({
             return (
               <div
                 key={srv.id}
-                className="group relative rounded-xl border border-zinc-800 bg-zinc-900/50 hover:bg-zinc-900/80 hover:border-zinc-700/80 transition-all p-5 shadow-sm"
+                className={`group relative rounded-xl border bg-zinc-900/50 hover:bg-zinc-900/80 transition-all p-5 shadow-sm nx-card-lift ${
+                  srv.status === 'building' || srv.status === 'deploying'
+                    ? 'border-amber-800/40 hover:border-amber-700/60'
+                    : 'border-zinc-800 hover:border-zinc-700/80'
+                }`}
               >
+                {/* Building shimmer strip along the top edge */}
+                {(srv.status === 'building' || srv.status === 'deploying') && (
+                  <span className="nx-shimmer absolute top-0 left-0 right-0 h-0.5 rounded-t-xl overflow-hidden" aria-hidden />
+                )}
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                   {/* Service Identity & Metadata */}
                   <div className="space-y-2 flex-1 min-w-0">
@@ -213,17 +221,17 @@ export default function ServicesList({
                         <span className="text-zinc-500">(${spec.priceHourly}/hr)</span>
                       </span>
 
-                      {/* Status indicator */}
+                      {/* Status indicator — pulsing ring for live workloads */}
                       <span className="flex items-center gap-1.5 text-[11px] font-mono">
                         <span
-                          className={`w-2 h-2 rounded-full ${
+                          className={`nx-status-dot ${
                             srv.status === 'running'
-                              ? 'bg-emerald-400 animate-pulse'
-                              : srv.status === 'deploying'
-                              ? 'bg-amber-400 animate-spin'
-                              : srv.status === 'building'
-                              ? 'bg-cyan-400 animate-pulse'
-                              : 'bg-zinc-600'
+                              ? 'nx-status-dot--running'
+                              : srv.status === 'deploying' || srv.status === 'building'
+                              ? 'nx-status-dot--building'
+                              : srv.status === 'failed'
+                              ? 'nx-status-dot--failed'
+                              : 'nx-status-dot--stopped'
                           }`}
                         />
                         <span className="text-zinc-300 capitalize">{srv.status}</span>
@@ -287,8 +295,8 @@ export default function ServicesList({
                   <div className="flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border border-zinc-800 text-xs font-mono">
                     <div>
                       <div className="text-[10px] text-zinc-500 uppercase">CPU / RAM</div>
-                      <div className="text-zinc-200 font-medium mt-0.5">
-                        {srv.metrics.cpuPercent}% &bull; {srv.metrics.ramUsedGb}GB
+                      <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
+                        {srv.metrics.cpuPercent}% <span className="text-zinc-600">&bull;</span> {srv.metrics.ramUsedGb}GB
                       </div>
                     </div>
 
@@ -307,8 +315,8 @@ export default function ServicesList({
 
                     <div className="border-l border-zinc-800 pl-3">
                       <div className="text-[10px] text-zinc-500 uppercase">Traffic &bull; P95</div>
-                      <div className="text-zinc-200 font-medium mt-0.5">
-                        {srv.metrics.requestsPerMin} rpm &bull; {srv.metrics.latencyP95Ms}ms
+                      <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
+                        {srv.metrics.requestsPerMin} <span className="text-zinc-500">rpm</span> <span className="text-zinc-600">&bull;</span> {srv.metrics.latencyP95Ms}ms
                       </div>
                     </div>
 

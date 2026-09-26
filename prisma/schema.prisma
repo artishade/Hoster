@@ -37,12 +37,14 @@ model Service {
   mcpDetailsJson     String?
   pluginDetailsJson  String?
   runtimeJson        String?  // live runner state: { pid, port, startedAt, mode, healthy }
+  webhookSecret      String?  @unique // HMAC secret for deploy webhooks (GitHub push → redeploy)
   lifecycleStartedAt DateTime @default(now()) // state machine anchor for building→deploying→running
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  logs LogEntry[]
-  data ServiceData[]
+  logs              LogEntry[]
+  data              ServiceData[]
+  webhookDeliveries WebhookDelivery[]
 }
 
 // Persistent key/value store for deployed services — the builtin runner's
@@ -175,6 +177,27 @@ model Provider {
   lastHeartbeatAt  DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
+}
+
+// ─── Deploy webhooks (GitHub push events, generic CI triggers) ────────────────
+
+model WebhookDelivery {
+  id        String   @id @default(cuid())
+  serviceId String?
+  source    String   @default("github") // github | generic
+  event     String   @default("push") // push | ping | manual
+  repo      String   @default("")
+  branch    String   @default("")
+  sender    String   @default("")
+  commitSha String   @default("")
+  result    String   @default("accepted") // accepted | skipped | rejected | error
+  detail    String   @default("")
+  createdAt DateTime @default(now())
+
+  service Service? @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([serviceId, createdAt])
 }
 
 // ─── Metrics history (host + services) ───────────────────────────────────────
