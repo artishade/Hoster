@@ -54,10 +54,17 @@ export default function ServicesList({
     return matchesType && matchesSearch;
   });
 
-  // Calculate cluster aggregate statistics
+  // Calculate cluster aggregate statistics — REAL numbers only
   const totalRequestsPerMin = services.reduce((acc, s) => acc + (s.metrics?.requestsPerMin || 0), 0);
   const totalGpuServices = services.filter((s) => HARDWARE_SPECS[s.hardwareTier]?.category === 'gpu').length;
   const runningServices = services.filter((s) => s.status === 'running').length;
+  const p95Values = services
+    .filter((s) => s.status === 'running')
+    .map((s) => s.metrics?.latencyP95Ms)
+    .filter((v): v is number => typeof v === 'number' && v > 0);
+  const avgP95 = p95Values.length
+    ? Math.round(p95Values.reduce((a, b) => a + b, 0) / p95Values.length)
+    : null;
 
   return (
     <div className="space-y-6">
@@ -90,13 +97,15 @@ export default function ServicesList({
         <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800/80">
           <div className="flex items-center justify-between text-xs text-zinc-400">
             <span>Aggregated Ingress</span>
-            <Activity className="w-4 h-4 text-indigo-400" />
+            <Activity className="w-4 h-4 text-violet-400" />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold font-mono text-zinc-100">{totalRequestsPerMin.toLocaleString()}</span>
-            <span className="text-xs text-indigo-300 font-mono">req/min</span>
+            <span className="text-xs text-violet-300 font-mono">req/min</span>
           </div>
-          <p className="text-[11px] text-zinc-500 mt-1">Average P95: 18ms</p>
+          <p className="text-[11px] text-zinc-500 mt-1">
+            {avgP95 !== null ? `Average P95: ${avgP95}ms · ${p95Values.length} live` : 'no live traffic samples yet'}
+          </p>
         </div>
 
         <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800/80">
@@ -183,7 +192,7 @@ export default function ServicesList({
                 {(srv.status === 'building' || srv.status === 'deploying') && (
                   <span className="nx-shimmer absolute top-0 left-0 right-0 h-0.5 rounded-t-xl overflow-hidden" aria-hidden />
                 )}
-                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
                   {/* Service Identity & Metadata */}
                   <div className="space-y-2 flex-1 min-w-0">
                     <div className="flex flex-wrap items-center gap-2.5">
@@ -208,17 +217,19 @@ export default function ServicesList({
                         {srv.type === 'mcp' ? 'MCP Server (SSE)' : srv.type === 'plugin' ? 'AI Plugin / OpenAPI' : 'API Provider'}
                       </span>
 
-                      {/* Hardware Spec Badge */}
+                      {/* Hardware Spec Badge — long tier names truncate with the
+                          full spec in the tooltip (VLM QA: was pushing into metrics) */}
                       <span
-                        className={`text-[10px] font-mono px-2 py-0.5 rounded flex items-center gap-1 border ${
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded flex items-center gap-1 border max-w-[190px] ${
                           isGpu
                             ? 'bg-emerald-950/50 text-emerald-300 border-emerald-700/60 font-semibold'
                             : 'bg-zinc-800/80 text-zinc-300 border-zinc-700/50'
                         }`}
+                        title={`${spec.name} — ${spec.vCpu} vCPU · ${spec.ramGb} GB · $${spec.priceHourly}/hr`}
                       >
-                        {isGpu ? <Cpu className="w-3 h-3 text-emerald-400" /> : <Server className="w-3 h-3 text-zinc-400" />}
-                        <span>{spec.gpuModel || spec.name}</span>
-                        <span className="text-zinc-500">(${spec.priceHourly}/hr)</span>
+                        {isGpu ? <Cpu className="w-3 h-3 text-emerald-400 shrink-0" /> : <Server className="w-3 h-3 text-zinc-400 shrink-0" />}
+                        <span className="truncate">{spec.gpuModel || spec.name}</span>
+                        <span className="text-zinc-500 shrink-0">(${spec.priceHourly}/hr)</span>
                       </span>
 
                       {/* Status indicator — pulsing ring for live workloads */}
@@ -292,8 +303,10 @@ export default function ServicesList({
                   </div>
 
                   {/* Live Metrics Snapshot — stopped/failed services have no
-                      live process, so metrics read N/A instead of fake zeros */}
-                  <div className="flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border border-zinc-800 text-xs font-mono">
+                      live process, so metrics read N/A instead of fake zeros.
+                      Top-aligned (lg:items-start) so the block sits at the same
+                      height on every card regardless of description length. */}
+                  <div className="flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border border-zinc-800 text-xs font-mono lg:mt-1">
                     <div>
                       <div className="text-[10px] text-zinc-500 uppercase">CPU / RAM</div>
                       <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
@@ -344,7 +357,7 @@ export default function ServicesList({
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center gap-2 shrink-0 lg:mt-1">
                     {isMcp && (
                       <button
                         onClick={() => onOpenMcpInspector(srv)}

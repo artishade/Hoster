@@ -115,6 +115,19 @@ export const RATE_FORMULA = '$0.008 / vCPU-hour + $0.004 / GB-RAM-hour';
 
 // ─── report ──────────────────────────────────────────────────────────────────
 
+export interface UsageProjectionRow {
+  serviceId: string;
+  name: string;
+  status: string;
+  tier: string;
+  ratePerHourUsd: number;
+  currentInstances: number;
+  maxInstances: number;
+  autoscaleCapable: boolean;
+  projectedCurrentUsd: number;
+  projectedMaxUsd: number;
+}
+
 export interface UsageReport {
   windowDays: number;
   global: {
@@ -123,7 +136,20 @@ export interface UsageReport {
     egressMb: number;
     equivalentCostUsd: number;
     paidUsd: number;
-    liveInstanceSeconds: number;
+    liveInstances: number;
+    unflushedRequests: number;
+  };
+  today: {
+    day: string;
+    equivalentUsd: number;
+    hoursElapsed: number;
+    runRateUsdPerDay: number;
+  };
+  projection: {
+    hoursPerMonth: number;
+    globalCurrentUsd: number;
+    globalMaxUsd: number;
+    perService: UsageProjectionRow[];
   };
   perDay: {
     day: string;
@@ -148,11 +174,16 @@ export interface UsageReport {
   rates: { formula: string; note: string };
 }
 
+/** Default hours-per-month used for projections (30d × 24h). */
+export const PROJECTION_HOURS_PER_MONTH = 720;
+
 export async function getUsageReport(windowDays = 30): Promise<UsageReport> {
   const days = Math.min(90, Math.max(1, Math.round(windowDays)));
   const sinceKey = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
 
-  const services = await db.service.findMany({ select: { id: true, name: true, status: true, hardwareTier: true } });
+  const services = await db.service.findMany({
+    select: { id: true, name: true, status: true, hardwareTier: true, instancesJson: true, runtimeJson: true },
+  });
   const byId = new Map(services.map((s) => [s.id, s]));
 
   const rows = await db.usageDaily.findMany({ where: { day: { gte: sinceKey } }, orderBy: { day: 'asc' } });
@@ -240,9 +271,55 @@ export async function getUsageReport(windowDays = 30): Promise<UsageReport> {
     d.equivalentCostUsd = +((dayCost.get(d.day) ?? 0)).toFixed(4);
   }
 
-  // live partial: requests/egress accumulated since the last sampler flush
-  let liveRequests = 0;
-  for (const p of pending.values()) liveRequests += p.requests;
+  // live snapshot: REAL instance counts now (primary + scale-out workers)
+  // and requests banked in memory since the last sampler flush (≤15s old).
+  let liveInstances = 0;
+  let unflushedRequests = 0;
+  for (const p of pending.values()) unflushedRequests += p.requests;
+
+  // ── autoscale-aware cost projection (round-6 recommendation) ─────────────
+  // what-you'd-pay-elsewhere if the current live footprint / the autoscaler
+  // max ran for a full month — REAL instance counts × real tier rates.
+  const perServiceProjection: UsageProjectionRow[] = [];
+  let globalCurrentUsd = 0;
+  let globalMaxUsd = 0;
+  for (const svc of services) {
+    const rate = tierRatePerHourUsd(svc.hardwareTier);
+    let maxInstances = 1;
+    try {
+      const inst = svc.instancesJson ? (JSON.parse(svc.instancesJson) as { max?: number }) : null;
+      maxInstances = Math.max(1, Math.min(10, inst?.max ?? 1));
+    } catch {
+      maxInstances = 1;
+    }
+    const running = svc.status === 'running';
+    const current = running ? liveInstanceCount(parseRuntime(svc.runtimeJson)) || 0 : 0;
+    if (running) liveInstances += current;
+    const projectedCurrentUsd = +(current * rate * PROJECTION_HOURS_PER_MONTH).toFixed(2);
+    const projectedMaxUsd = +(maxInstances * rate * PROJECTION_HOURS_PER_MONTH).toFixed(2);
+    const scalable = maxInstances > 1;
+    perServiceProjection.push({
+      serviceId: svc.id,
+      name: svc.name,
+      status: svc.status,
+      tier: svc.hardwareTier,
+      ratePerHourUsd: rate,
+      currentInstances: current,
+      maxInstances,
+      autoscaleCapable: scalable,
+      projectedCurrentUsd,
+      projectedMaxUsd,
+    });
+    globalCurrentUsd += projectedCurrentUsd;
+    globalMaxUsd += projectedMaxUsd;
+  }
+  perServiceProjection.sort((a, b) => b.projectedMaxUsd - a.projectedMaxUsd || b.projectedCurrentUsd - a.projectedCurrentUsd);
+
+  // ── today's burn-rate: metered-so-far ÷ hours-elapsed-in-day ────────────
+  const dayKey = todayKey();
+  const hoursElapsed = Math.max(0.05, (Date.now() - Date.parse(`${dayKey}T00:00:00Z`)) / 3_600_000);
+  const todayCost = dayCost.get(dayKey) ?? 0;
+  const runRateUsdPerDay = +(todayCost / (hoursElapsed / 24)).toFixed(4);
 
   perService.sort((a, b) => b.equivalentCostUsd - a.equivalentCostUsd || b.requests - a.requests);
 
@@ -254,7 +331,20 @@ export async function getUsageReport(windowDays = 30): Promise<UsageReport> {
       egressMb: +globalEgressMb.toFixed(4),
       equivalentCostUsd: +globalCost.toFixed(4),
       paidUsd: 0,
-      liveInstanceSeconds: liveRequests, // unflushed request count — surfaced as "live now"
+      liveInstances,
+      unflushedRequests,
+    },
+    today: {
+      day: dayKey,
+      equivalentUsd: +todayCost.toFixed(4),
+      hoursElapsed: +hoursElapsed.toFixed(2),
+      runRateUsdPerDay,
+    },
+    projection: {
+      hoursPerMonth: PROJECTION_HOURS_PER_MONTH,
+      globalCurrentUsd: +globalCurrentUsd.toFixed(2),
+      globalMaxUsd: +globalMaxUsd.toFixed(2),
+      perService: perServiceProjection,
     },
     perDay,
     perService,
@@ -263,4 +353,12 @@ export async function getUsageReport(windowDays = 30): Promise<UsageReport> {
       note: 'Equivalent-cost comparison only — every unit is real measured usage. NexusHost free tier bills $0.00.',
     },
   };
+}
+
+function parseRuntime(json: string | null): ServiceRuntime | null {
+  try {
+    return json ? (JSON.parse(json) as ServiceRuntime) : null;
+  } catch {
+    return null;
+  }
 }

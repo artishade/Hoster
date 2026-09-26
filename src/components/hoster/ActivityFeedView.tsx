@@ -19,6 +19,7 @@ import {
   ChevronDown,
   Activity,
   Webhook,
+  Gauge,
 } from 'lucide-react';
 import { useLogs } from '@/hooks/useHoster';
 import type { LogEntry } from '@/lib/hoster/types';
@@ -53,6 +54,7 @@ const SCOPES = [
   { id: 'database', label: 'Databases', icon: Database, color: 'text-rose-400', dot: 'bg-rose-400' },
   { id: 'domain', label: 'Domains/DNS', icon: Globe, color: 'text-sky-400', dot: 'bg-sky-400' },
   { id: 'storage', label: 'Storage', icon: HardDrive, color: 'text-amber-400', dot: 'bg-amber-400' },
+  { id: 'usage', label: 'Usage', icon: Gauge, color: 'text-teal-400', dot: 'bg-teal-400' },
   { id: 'system', label: 'System', icon: Cpu, color: 'text-zinc-400', dot: 'bg-zinc-400' },
 ] as const;
 
@@ -89,6 +91,7 @@ const sourceLabels: Record<string, string> = {
   'terminal-service': 'terminal',
   exec: 'exec',
   'webhook-receiver': 'webhook',
+  'usage-meter': 'usage-meter',
 };
 
 export default function ActivityFeedView() {
@@ -147,8 +150,9 @@ export default function ActivityFeedView() {
       const s = l.source ?? 'nexus-platform';
       if (s === 'git-deployer' || s === 'build-runner' || s === 'orchestrator') return 'deploy';
       if (s === 'webhook-receiver') return 'webhooks';
+      if (s === 'usage-meter') return 'usage';
       if (s === 'watchdog' || s === 'node-agent' || s === 'settings') return 'provider';
-      if (s === 'app' || s === 'service-runner' || s === 'terminal-service') return 'service';
+      if (s === 'app' || s === 'service-runner' || s === 'terminal-service' || s === 'exec') return 'service';
       if (s === 'db-provisioner' || s === 'sql-console') return 'database';
       if (s === 'edge-dns') return 'domain';
       if (s === 'volume-provisioner') return 'storage';

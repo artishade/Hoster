@@ -30,6 +30,11 @@ const MAX_OUTPUT_BYTES = 128 * 1024;
 const HISTORY_CAP = 25;
 const GLOBAL_CONCURRENCY = 4;
 
+// ── hourly rate caps (round-6 recommendation: shared-operator abuse guard) ──
+const PER_SERVICE_HOURLY = 60;
+const GLOBAL_HOURLY = 240;
+const HOUR_MS = 3_600_000;
+
 export interface ExecResult {
   id: string;
   command: string;
@@ -47,8 +52,34 @@ interface ExecGlobal {
   __nxExecInFlight?: Map<string, true>;
   __nxExecHistory?: Map<string, ExecResult[]>;
   __nxExecSeq?: number;
+  __nxExecRate?: Map<string, number[]>; // key: serviceId | '__global' → timestamps
 }
 const g = globalThis as ExecGlobal;
+
+function rateWindow(): Map<string, number[]> {
+  const w = g.__nxExecRate ?? new Map<string, number[]>();
+  g.__nxExecRate = w;
+  return w;
+}
+
+/** Counts exec starts in the rolling hour + prunes expired stamps. */
+function hourlyCount(w: Map<string, number[]>, key: string): number {
+  const now = Date.now();
+  const stamps = (w.get(key) ?? []).filter((t) => now - t < HOUR_MS);
+  w.set(key, stamps);
+  return stamps.length;
+}
+
+/** Records a start in the window (called after all guards pass). */
+function recordStart(w: Map<string, number[]>, serviceId: string): void {
+  const now = Date.now();
+  const svc = w.get(serviceId) ?? [];
+  svc.push(now);
+  w.set(serviceId, svc.filter((t) => now - t < HOUR_MS));
+  const glb = w.get('__global') ?? [];
+  glb.push(now);
+  w.set('__global', glb.filter((t) => now - t < HOUR_MS));
+}
 
 function historyFor(serviceId: string): ExecResult[] {
   const hist = g.__nxExecHistory ?? new Map<string, ExecResult[]>();
@@ -112,7 +143,21 @@ export async function runServiceExec(
   if (inflight.size >= GLOBAL_CONCURRENCY) {
     throw { status: 429, error: 'exec queue is saturated platform-wide — retry in a moment' } as RunExecError;
   }
+
+  // hourly rate guardrails (rolling window, in-memory)
+  const w = rateWindow();
+  if (hourlyCount(w, svc.id) >= PER_SERVICE_HOURLY) {
+    throw {
+      status: 429,
+      error: `exec rate limit reached for this service (${PER_SERVICE_HOURLY}/hour) — the one-shot API is for quick ops, use the PTY workspace shell for interactive work`,
+    } as RunExecError;
+  }
+  if (hourlyCount(w, '__global') >= GLOBAL_HOURLY) {
+    throw { status: 429, error: `platform-wide exec rate limit reached (${GLOBAL_HOURLY}/hour) — retry later` } as RunExecError;
+  }
+
   inflight.set(svc.id, true);
+  recordStart(w, svc.id);
 
   const t0 = Date.now();
   try {

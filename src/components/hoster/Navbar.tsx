@@ -71,7 +71,7 @@ export default function Navbar({ onNewDeploy, onOpenAdvisor, activeView, onSelec
                   Live Cloud Hub
                 </span>
               </div>
-              <p className="text-[11px] text-zinc-400 hidden sm:block">
+              <p className="text-[11px] text-zinc-400 hidden sm:block truncate max-w-[420px] lg:max-w-none" title="Real Hardware Telemetry • Free Provider Pooling • Custom VPS Nodes">
                 Real Hardware Telemetry &bull; Free Provider Pooling &bull; Custom VPS Nodes
               </p>
             </div>

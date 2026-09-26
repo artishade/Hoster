@@ -1,7 +1,7 @@
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import { db } from '@/lib/db';
 import { allocatePort, recordExternalRequest, stopRuntime, writeRunnerLog, getLiveStateSnapshot } from './runtime';
 import { readProcStats, isPidAlive, forgetPid } from './procstats';
@@ -24,6 +24,20 @@ import type { ServiceRuntime } from './types';
  */
 
 export const DEPLOY_ROOT = path.join(process.cwd(), 'deployments');
+
+/** uv availability probe — cached for the process lifetime (uv is a static
+ *  binary at /usr/local/bin/uv on this host; pip stays the fallback). */
+function hasUv(): boolean {
+  const g = globalThis as typeof globalThis & { __nxUvAvailable?: boolean };
+  if (typeof g.__nxUvAvailable === 'boolean') return g.__nxUvAvailable;
+  try {
+    const p = spawnSync('bash', ['-lc', 'command -v uv'], { timeout: 8_000 });
+    g.__nxUvAvailable = p.status === 0;
+  } catch {
+    g.__nxUvAvailable = false;
+  }
+  return g.__nxUvAvailable;
+}
 
 const GIT_TIMEOUT_MS = 120_000;
 const INSTALL_TIMEOUT_MS = 240_000;
@@ -56,7 +70,11 @@ function appLogPath(workspace: string): string {
 /**
  * Tail a service's app.log file → LogEntry rows (source 'app').
  * Survives control-plane restarts, streams at ~1s granularity, and caps
- * the persisted line rate so a chatty app can't flood the DB.
+ * the persisted line rate so a chatty app (gunicorn logs every request)
+ * can't flood the activity feed. Error-grade lines (error/traceback/fatal)
+ * get their own, larger budget so failures always stream; skipped info
+ * lines are summarized once per tick (the full history stays in app.log
+ * and the FILE HISTORY view).
  */
 function tailAppLog(serviceId: string, logPath: string): void {
   const g = globalThis as DeployGlobal;
@@ -78,8 +96,18 @@ function tailAppLog(serviceId: string, logPath: string): void {
   }
 
   const BUDGET_WINDOW_MS = 30_000;
-  const BUDGET_LINES = 60; // max persisted lines per 30s window
-  const budgetTimes: number[] = [];
+  const INFO_BUDGET_LINES = 12; // info-grade lines per 30s window
+  const ALERT_BUDGET_LINES = 30; // error-grade lines per 30s window
+  const infoTimes: number[] = [];
+  const alertTimes: number[] = [];
+
+  function lineLooksAlarming(line: string): boolean {
+    const l = line.toLowerCase();
+    return l.includes('error') || l.includes('traceback') || l.includes('critical') || l.includes('fatal') || l.includes('panic');
+  }
+
+  let skippedSinceSummary = 0;
+  let lastSummaryAt = 0;
 
   const timer = setInterval(() => {
     try {
@@ -93,15 +121,33 @@ function tailAppLog(serviceId: string, logPath: string): void {
       offset += length;
       const text = buf.toString('utf8');
 
-      // trim the in-window budget
+      // trim the in-window budgets
       const now = Date.now();
-      while (budgetTimes.length && now - budgetTimes[0] > BUDGET_WINDOW_MS) budgetTimes.shift();
+      while (infoTimes.length && now - infoTimes[0] > BUDGET_WINDOW_MS) infoTimes.shift();
+      while (alertTimes.length && now - alertTimes[0] > BUDGET_WINDOW_MS) alertTimes.shift();
 
+      let skipped = 0;
       for (const line of text.split(/[\r\n]+/)) {
         if (!line.trim()) continue;
-        if (budgetTimes.length >= BUDGET_LINES) continue; // rate-limited, not lost on disk
-        budgetTimes.push(now);
+        const alarming = lineLooksAlarming(line);
+        const budget = alarming ? alertTimes : infoTimes;
+        const cap = alarming ? ALERT_BUDGET_LINES : INFO_BUDGET_LINES;
+        if (budget.length >= cap) {
+          skippedSinceSummary += 1;
+          continue; // rate-limited, not lost on disk
+        }
+        budget.push(now);
         void writeRunnerLog(serviceId, line.trimEnd().slice(0, 2000), 'app');
+      }
+      // coalesced skip summary: at most one per window, carrying the total
+      if (skippedSinceSummary > 0 && now - lastSummaryAt > BUDGET_WINDOW_MS) {
+        void writeRunnerLog(
+          serviceId,
+          `… ${skippedSinceSummary} app line${skippedSinceSummary === 1 ? '' : 's'} rate-limited in the last window (info-grade; full history in app.log / FILE HISTORY view)`,
+          'app'
+        );
+        skippedSinceSummary = 0;
+        lastSummaryAt = now;
       }
     } catch {
       /* file rotated/removed */
@@ -508,8 +554,26 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       // ── Venv isolation: each python service gets its own .venv inside its
       // workspace — dependencies never leak between services or into the
       // user's --user site-packages (heavy ML repos stop colliding).
+      //
+      // uv fast path: when the uv binary exists (10–100× faster dependency
+      // resolution + a hardlink cache shared across services), the venv and
+      // the install both go through uv; any failure falls back to the
+      // classic python3 -m venv + pip path.
+      const uvOk = hasUv();
       const venvPython = path.join(repoDir, '.venv', 'bin', 'python');
       let venvOk = fs.existsSync(venvPython);
+      if (!venvOk && uvOk) {
+        await dlog(svc.id, 'Creating isolated virtualenv with uv (fast path, hardlink cache)...');
+        const venv = await run('uv', ['venv', '--clear', '.venv'], {
+          cwd: repoDir,
+          timeoutMs: 60_000,
+          onLine: (line) => void dlog(svc.id, `[uv venv] ${line}`),
+        });
+        venvOk = venv.code === 0 && fs.existsSync(venvPython);
+        if (!venvOk) {
+          await dlog(svc.id, `uv venv failed: ${tailText(venv.stderr, 400)} — falling back to python3 -m venv`, 'warn');
+        }
+      }
       if (!venvOk) {
         await dlog(svc.id, 'Creating isolated python virtualenv (.venv) in the workspace...');
         const venv = await run('python3', ['-m', 'venv', '--clear', '.venv'], {
@@ -523,14 +587,39 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
         }
       }
       if (venvOk) {
-        await dlog(svc.id, 'Installing python dependencies into the isolated venv (pip)...');
-        const pip = await run(venvPython, ['-m', 'pip', 'install', '--no-input', '-r', 'requirements.txt'], {
-          cwd: repoDir,
-          timeoutMs: INSTALL_TIMEOUT_MS,
-          onLine: (line) => void dlog(svc.id, `[pip] ${line}`),
-        });
-        if (pip.code !== 0) {
-          await dlog(svc.id, `pip install FAILED: ${tailText(pip.stderr, 600)} — continuing, app may still boot`, 'warn');
+        let installed = false;
+        if (uvOk) {
+          await dlog(svc.id, 'Installing python dependencies with uv (parallel resolver, venv-pinned)...');
+          const inst = await run('uv', ['pip', 'install', '--python', venvPython, '-r', 'requirements.txt'], {
+            cwd: repoDir,
+            timeoutMs: INSTALL_TIMEOUT_MS,
+            onLine: (line) => void dlog(svc.id, `[uv] ${line}`),
+          });
+          if (inst.code === 0) {
+            installed = true;
+          } else {
+            await dlog(svc.id, `uv install failed: ${tailText(inst.stderr, 400)} — falling back to pip`, 'warn');
+            // uv-created venvs have no pip binary — rebuild the venv the
+            // classic way so the pip fallback below can run at all.
+            if (!fs.existsSync(path.join(repoDir, '.venv', 'bin', 'pip'))) {
+              const venv2 = await run('python3', ['-m', 'venv', '--clear', '.venv'], {
+                cwd: repoDir,
+                timeoutMs: 180_000,
+              });
+              venvOk = venv2.code === 0 && fs.existsSync(venvPython);
+            }
+          }
+        }
+        if (!installed && venvOk) {
+          await dlog(svc.id, 'Installing python dependencies into the isolated venv (pip)...');
+          const pip = await run(venvPython, ['-m', 'pip', 'install', '--no-input', '-r', 'requirements.txt'], {
+            cwd: repoDir,
+            timeoutMs: INSTALL_TIMEOUT_MS,
+            onLine: (line) => void dlog(svc.id, `[pip] ${line}`),
+          });
+          if (pip.code !== 0) {
+            await dlog(svc.id, `pip install FAILED: ${tailText(pip.stderr, 600)} — continuing, app may still boot`, 'warn');
+          }
         }
         // Pin the start command to the venv interpreter (both auto-detected
         // and user-supplied python3/python invocations).

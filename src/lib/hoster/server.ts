@@ -7,6 +7,7 @@ import { computeServiceMetrics, computePostgresUsage, computeRedisUsage, hostTot
 import { ensureRuntime, getLiveStateSnapshot } from './runtime';
 import { deployProcessStats, getDeployHandle } from './deployer';
 import { flushServiceUsage } from './usage';
+import { checkUsageAlerts } from './usage-alerts';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from './hardware-specs';
 import type {
   Service,
@@ -432,6 +433,12 @@ export async function recordHostSample(): Promise<void> {
       } catch {
         /* usage metering must never break the sampler */
       }
+    }
+    // ── usage budget alerts (60s internal throttle; real LogEntry rows) ──
+    try {
+      await checkUsageAlerts();
+    } catch {
+      /* alerting must never break the sampler */
     }
     // trim service samples
     const svcCount = await db.metricSample.count({ where: { scope: 'service' } });

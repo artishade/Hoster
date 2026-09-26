@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
     if (!message) return NextResponse.json({ error: 'message required' }, { status: 400 });
 
     const level = ['info', 'warn', 'error', 'debug'].includes(body.level ?? '') ? body.level! : 'info';
-    const SCOPE_WHITELIST = ['system', 'service', 'database', 'storage', 'domain', 'provider', 'deploy'];
+    const SCOPE_WHITELIST = ['system', 'service', 'database', 'storage', 'domain', 'provider', 'deploy', 'usage'];
     let scope = SCOPE_WHITELIST.includes(body.scope ?? '') ? body.scope! : 'system';
     const source = typeof body.source === 'string' ? body.source.slice(0, 60) : 'external';
 

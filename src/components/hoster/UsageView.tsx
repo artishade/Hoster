@@ -1,16 +1,22 @@
 'use client';
 
 /**
- * UsageView — REAL usage metering & the "what you'd pay elsewhere" meter.
+ * UsageView — REAL usage metering, budget alerts & the "what you'd pay
+ * elsewhere" meter.
  *
  * All numbers are measured: instance-hours = uptime × live instance count
  * (banked by the 15s sampler), requests = every proxied ingress request,
  * egress = response bytes when content-length is known. The equivalent-cost
  * figure multiplies this REAL usage by public cloud list prices — the
  * platform itself bills $0.00 (free tier), shown side by side.
+ *
+ * The alerts card surfaces the usage-meter's REAL LogEntry warnings
+ * (thresholds crossed today), and the projection card is autoscale-aware:
+ * live instance counts × tier rates × 720h, at the current footprint AND
+ * at each service's configured autoscaler max.
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useUsage } from '@/hooks/useHoster';
 import {
   Receipt,
@@ -22,6 +28,12 @@ import {
   Loader2,
   Server,
   TrendingUp,
+  BellRing,
+  Scale,
+  Gauge,
+  AlertTriangle,
+  XCircle,
+  CheckCircle2,
 } from 'lucide-react';
 
 const STATUS_DOT: Record<string, string> = {
@@ -51,10 +63,51 @@ function fmtMb(mb: number): string {
   return `${(mb * 1024).toFixed(0)} KB`;
 }
 
+function relTime(iso: string): string {
+  const diff = Math.max(0, Date.now() - new Date(iso).getTime());
+  const s = Math.floor(diff / 1000);
+  if (s < 5) return 'now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ago`;
+}
+
+interface AlertRow {
+  id: string;
+  level: string;
+  message: string;
+  timestamp: string; // serialized LogEntry field (ISO string)
+}
+
 export default function UsageView() {
   const [days, setDays] = useState(30);
   const usageQ = useUsage(days);
   const report = usageQ.data;
+
+  // REAL usage alert rows (scope 'usage' — written by the usage-meter)
+  const [alerts, setAlerts] = useState<AlertRow[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/logs?scope=usage&limit=12', { cache: 'no-store' });
+        if (res.ok) {
+          const json = (await res.json()) as { data?: AlertRow[] };
+          if (alive && Array.isArray(json.data)) setAlerts(json.data);
+        }
+      } catch {
+        /* best-effort */
+      }
+    };
+    load();
+    const t = setInterval(load, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
 
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-full">
@@ -108,7 +161,12 @@ export default function UsageView() {
                 <Clock3 className="w-3.5 h-3.5 text-cyan-400" /> instance-hours
               </span>
               <div className="text-2xl font-bold font-mono text-zinc-100 mt-1.5 tabular-nums">{fmtHours(report.global.instanceHours)}</div>
-              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">real uptime × live instances · last {report.windowDays}d</p>
+              <p className="text-[10px] text-zinc-500 font-mono mt-1.5">
+                real uptime × live instances · last {report.windowDays}d
+                {report.global.liveInstances > 0 && (
+                  <span className="text-emerald-400/90"> · {report.global.liveInstances} live now</span>
+                )}
+              </p>
             </div>
             <div className="p-4 rounded-xl bg-zinc-900/60 border border-zinc-800">
               <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider flex items-center gap-1.5">
@@ -116,6 +174,9 @@ export default function UsageView() {
               </span>
               <div className="text-2xl font-bold font-mono text-zinc-100 mt-1.5 tabular-nums">
                 {report.global.requests.toLocaleString()}
+                {report.global.unflushedRequests > 0 && (
+                  <span className="text-[11px] text-cyan-400/90 ml-1.5">+{report.global.unflushedRequests} live</span>
+                )}
               </div>
               <p className="text-[10px] text-zinc-500 font-mono mt-1.5">every request through the edge ingress</p>
             </div>
@@ -137,6 +198,9 @@ export default function UsageView() {
             </div>
           </div>
 
+          {/* Usage alerts — REAL LogEntry rows from the usage-meter */}
+          <UsageAlertsCard alerts={alerts} todayRunRate={report.today} />
+
           {/* 30-day chart */}
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
             <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
@@ -152,6 +216,9 @@ export default function UsageView() {
               </div>
             </div>
           </div>
+
+          {/* Autoscale-aware cost projection */}
+          <ProjectionCard projection={report.projection} today={report.today} />
 
           {/* Per-service table */}
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
@@ -230,6 +297,225 @@ export default function UsageView() {
   );
 }
 
+// ─── usage alerts card ────────────────────────────────────────────────────────
+
+function UsageAlertsCard({
+  alerts,
+  todayRunRate,
+}: {
+  alerts: AlertRow[];
+  todayRunRate: { day: string; equivalentUsd: number; hoursElapsed: number; runRateUsdPerDay: number };
+}) {
+  const todayAlerts = alerts.filter((a) => (a.timestamp ?? '').slice(0, 10) === todayRunRate.day);
+  const warnCount = todayAlerts.filter((a) => a.level === 'warn' || a.level === 'error').length;
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800/80 bg-zinc-950/60 flex-wrap gap-2">
+        <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+          <BellRing className={`w-4 h-4 ${warnCount > 0 ? 'text-amber-400 animate-pulse' : 'text-teal-400'}`} />
+          Usage alerts — budget warnings
+          {todayAlerts.length > 0 && (
+            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+              warnCount > 0
+                ? 'bg-amber-950/50 border-amber-800/60 text-amber-300'
+                : 'bg-teal-950/50 border-teal-800/60 text-teal-300'
+            }`}>
+              {todayAlerts.length} today{warnCount > 0 ? ` · ${warnCount} warn+` : ''}
+            </span>
+          )}
+        </h3>
+        <span className="text-[10px] font-mono text-zinc-600">real LogEntry rows from the usage-meter · 10s poll</span>
+      </div>
+
+      {/* threshold ladder */}
+      <div className="px-4 py-2.5 border-b border-zinc-800/60 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] font-mono text-zinc-500">
+        <span className="flex items-center gap-1.5">
+          <Gauge className="w-3 h-3 text-teal-400" />
+          instance-hours: <span className="text-zinc-300">2h · 6h · 12h</span> /day
+        </span>
+        <span className="flex items-center gap-1.5">
+          <Wallet className="w-3 h-3 text-amber-400" />
+          equiv. cost: <span className="text-zinc-300">$0.10 · $0.50 · $2.00</span> /day
+        </span>
+        <span className="flex items-center gap-1.5">
+          <Scale className="w-3 h-3 text-rose-400" />
+          platform budget: <span className="text-zinc-300">$1.00</span> /day
+        </span>
+      </div>
+
+      {todayAlerts.length === 0 ? (
+        <div className="px-4 py-5 flex items-start gap-2.5">
+          <CheckCircle2 className="w-4 h-4 text-emerald-500/80 shrink-0 mt-0.5" />
+          <div className="text-[11px] text-zinc-500 font-mono leading-relaxed">
+            no thresholds crossed today — today so far:{' '}
+            <span className="text-zinc-300">{fmtUsd(todayRunRate.equivalentUsd)}</span> equivalent over{' '}
+            <span className="text-zinc-300">{todayRunRate.hoursElapsed}h</span> elapsed
+            {todayRunRate.runRateUsdPerDay > 0 && (
+              <> · run-rate <span className="text-zinc-300">{fmtUsd(todayRunRate.runRateUsdPerDay)}/day</span></>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="max-h-56 overflow-y-auto custom-scrollbar divide-y divide-zinc-800/40">
+          {todayAlerts.map((a) => {
+            const isErr = a.level === 'error';
+            const isWarn = a.level === 'warn';
+            return (
+              <div key={a.id} className="px-4 py-2.5 flex items-start gap-2.5 hover:bg-zinc-900/50 transition">
+                {isErr ? (
+                  <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                ) : isWarn ? (
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                ) : (
+                  <Gauge className="w-3.5 h-3.5 text-teal-400 shrink-0 mt-0.5" />
+                )}
+                <p className="text-[11px] font-mono text-zinc-300 leading-relaxed flex-1 min-w-0 break-words">
+                  {a.message}
+                </p>
+                <span className="text-[10px] font-mono text-zinc-600 shrink-0 whitespace-nowrap mt-0.5">{relTime(a.timestamp)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── autoscale-aware cost projection card ─────────────────────────────────────
+
+function ProjectionCard({
+  projection,
+  today,
+}: {
+  projection: {
+    hoursPerMonth: number;
+    globalCurrentUsd: number;
+    globalMaxUsd: number;
+    perService: {
+      serviceId: string;
+      name: string;
+      status: string;
+      tier: string;
+      ratePerHourUsd: number;
+      currentInstances: number;
+      maxInstances: number;
+      autoscaleCapable: boolean;
+      projectedCurrentUsd: number;
+      projectedMaxUsd: number;
+    }[];
+  };
+  today: { runRateUsdPerDay: number; equivalentUsd: number; hoursElapsed: number };
+}) {
+  const scalable = projection.perService.filter((p) => p.autoscaleCapable);
+  const maxBar = Math.max(0.01, ...projection.perService.map((p) => p.projectedMaxUsd));
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800/80 bg-zinc-950/60 flex-wrap gap-2">
+        <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+          <Scale className="w-4 h-4 text-amber-400" />
+          Cost projection — next 30 days ({projection.hoursPerMonth}h)
+        </h3>
+        <span className="text-[10px] font-mono text-zinc-600">
+          autoscale-aware · live instances × tier rate × 720h
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-zinc-800/60">
+        <div className="bg-zinc-900/60 px-4 py-3.5">
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono flex items-center gap-1.5">
+            <Server className="w-3 h-3 text-cyan-400" /> at current footprint
+          </div>
+          <div className="text-xl font-bold font-mono text-zinc-100 mt-1 tabular-nums">
+            {fmtUsd(projection.globalCurrentUsd)}
+          </div>
+          <p className="text-[10px] text-zinc-500 font-mono mt-1">live instances only · you pay $0.00</p>
+        </div>
+        <div className="bg-zinc-900/60 px-4 py-3.5">
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono flex items-center gap-1.5">
+            <Scale className="w-3 h-3 text-amber-400" /> at autoscaler max
+          </div>
+          <div className="text-xl font-bold font-mono text-amber-200 mt-1 tabular-nums">
+            {fmtUsd(projection.globalMaxUsd)}
+          </div>
+          <p className="text-[10px] text-zinc-500 font-mono mt-1">
+            all services pinned at configured max instances
+          </p>
+        </div>
+        <div className="bg-zinc-900/60 px-4 py-3.5">
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono flex items-center gap-1.5">
+            <TrendingUp className="w-3 h-3 text-emerald-400" /> today's run-rate
+          </div>
+          <div className="text-xl font-bold font-mono text-zinc-100 mt-1 tabular-nums">
+            {fmtUsd(today.runRateUsdPerDay)}
+            <span className="text-xs text-zinc-500 font-normal">/day</span>
+          </div>
+          <p className="text-[10px] text-zinc-500 font-mono mt-1">
+            {fmtUsd(today.equivalentUsd)} metered over {today.hoursElapsed}h elapsed → 30d ≈ {fmtUsd(today.runRateUsdPerDay * 30)}
+          </p>
+        </div>
+      </div>
+
+      {projection.perService.length > 0 && (
+        <div className="max-h-72 overflow-y-auto custom-scrollbar divide-y divide-zinc-800/40">
+          {projection.perService.slice(0, 8).map((p) => (
+            <div key={p.serviceId} className="px-4 py-2.5 flex items-center gap-3">
+              <div className="flex items-center gap-2 w-40 sm:w-48 shrink-0 min-w-0">
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${STATUS_DOT[p.status] ?? 'bg-zinc-600'}`} />
+                <span className="font-mono text-[11px] text-zinc-300 truncate">{p.name}</span>
+              </div>
+
+              {/* dual bar: current (cyan) within max (amber outline) */}
+              <div className="flex-1 min-w-0 h-4 relative rounded bg-zinc-950/70 border border-zinc-800/60 overflow-hidden">
+                <div
+                  className="absolute inset-y-0 left-0 bg-amber-500/15 border-r border-amber-700/40"
+                  style={{ width: `${Math.max(2, (p.projectedMaxUsd / maxBar) * 100)}%` }}
+                  title={`at max: ${fmtUsd(p.projectedMaxUsd)} (${p.maxInstances} instances)`}
+                />
+                <div
+                  className="absolute inset-y-0 left-0 bg-cyan-600/60"
+                  style={{ width: `${Math.max(1, (p.projectedCurrentUsd / maxBar) * 100)}%` }}
+                  title={`at current: ${fmtUsd(p.projectedCurrentUsd)} (${p.currentInstances} live)`}
+                />
+                <span className="absolute inset-y-0 right-2 flex items-center text-[10px] font-mono text-zinc-400 tabular-nums pointer-events-none">
+                  {fmtUsd(p.projectedCurrentUsd)} → {fmtUsd(p.projectedMaxUsd)}
+                </span>
+              </div>
+
+              <div className="hidden sm:flex items-center gap-2 shrink-0">
+                <span className="font-mono text-[10px] text-zinc-500 tabular-nums">
+                  {p.currentInstances}/{p.maxInstances} inst
+                </span>
+                {p.autoscaleCapable ? (
+                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-amber-950/50 border border-amber-800/60 text-amber-300">
+                    scales ×{p.maxInstances}
+                  </span>
+                ) : (
+                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-500">
+                    fixed
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="px-4 py-2.5 border-t border-zinc-800/60 flex items-start gap-2">
+        <Info className="w-3.5 h-3.5 text-zinc-500 shrink-0 mt-0.5" />
+        <p className="text-[10px] text-zinc-500 font-mono leading-relaxed">
+          {scalable.length > 0
+            ? `${scalable.length} service${scalable.length === 1 ? '' : 's'} autoscale-enabled: workers multiply instance-hours, so the max-scale column is the worst-case what-you'd-pay-elsewhere. `
+            : 'no autoscale-enabled services yet — set max instances > 1 on a service to see the scaled projection. '}
+          every tier bills $0.00 on this platform — projections are the equivalent-cloud-cost comparison only.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ─── lightweight dual-axis chart (bars: instance-hours, line: requests) ───────
 
 function DailyUsageChart({
@@ -239,7 +525,7 @@ function DailyUsageChart({
 }) {
   const W = 760;
   const H = 190;
-  const PAD = { l: 34, r: 34, t: 14, b: 20 };
+  const PAD = { l: 40, r: 40, t: 18, b: 20 };
   const innerW = W - PAD.l - PAD.r;
   const innerH = H - PAD.t - PAD.b;
 
@@ -257,6 +543,7 @@ function DailyUsageChart({
     .join(' ');
 
   const labelEvery = Math.ceil(n / 10);
+  const lastDay = perDay[perDay.length - 1]?.day;
 
   return (
     <div className="w-full">
@@ -279,6 +566,7 @@ function DailyUsageChart({
           const x = PAD.l + (innerW / n) * i + (innerW / n - barW) / 2;
           const h = Math.max(0, (d.instanceHours / maxHours) * innerH);
           const y = PAD.t + innerH - h;
+          const isToday = d.day === lastDay;
           return (
             <rect
               key={d.day}
@@ -287,10 +575,10 @@ function DailyUsageChart({
               width={barW}
               height={h}
               rx={Math.min(2, barW / 2)}
-              fill="#0e7490"
-              opacity={d.instanceHours > 0 ? 0.85 : 0.25}
+              fill={isToday ? '#22d3ee' : '#0e7490'}
+              opacity={d.instanceHours > 0 ? (isToday ? 0.9 : 0.85) : 0.25}
             >
-              <title>{`${d.day}: ${fmtHours(d.instanceHours)} instance-hrs · ${d.requests} req · ${fmtUsd(d.equivalentCostUsd)}`}</title>
+              <title>{`${d.day}${isToday ? ' (today)' : ''}: ${fmtHours(d.instanceHours)} instance-hrs · ${d.requests} req · ${fmtUsd(d.equivalentCostUsd)}`}</title>
             </rect>
           );
         })}
@@ -304,17 +592,17 @@ function DailyUsageChart({
             fill="#a78bfa"
           />
         )}
-        {/* axis labels */}
-        <text x={4} y={PAD.t + 4} fontSize="8.5" fill="#52525b" fontFamily="monospace">
+        {/* axis labels — anchored inside the left/right gutters, clear of the title */}
+        <text x={PAD.l - 6} y={PAD.t + 4} fontSize="8.5" fill="#52525b" fontFamily="monospace" textAnchor="end">
           {fmtHours(maxHours)}h
         </text>
-        <text x={4} y={PAD.t + innerH} fontSize="8.5" fill="#52525b" fontFamily="monospace">
+        <text x={PAD.l - 6} y={PAD.t + innerH} fontSize="8.5" fill="#52525b" fontFamily="monospace" textAnchor="end">
           0h
         </text>
-        <text x={W - PAD.r + 4} y={PAD.t + 4} fontSize="8.5" fill="#52525b" fontFamily="monospace">
+        <text x={W - PAD.r + 6} y={PAD.t + 4} fontSize="8.5" fill="#52525b" fontFamily="monospace">
           {maxReq >= 1000 ? `${(maxReq / 1000).toFixed(1)}k` : maxReq}
         </text>
-        <text x={W - PAD.r + 4} y={PAD.t + innerH} fontSize="8.5" fill="#52525b" fontFamily="monospace">
+        <text x={W - PAD.r + 6} y={PAD.t + innerH} fontSize="8.5" fill="#52525b" fontFamily="monospace">
           0
         </text>
         {perDay.map((d, i) =>
@@ -324,7 +612,7 @@ function DailyUsageChart({
               x={PAD.l + (innerW / n) * (i + 0.5)}
               y={H - 6}
               fontSize="8.5"
-              fill="#52525b"
+              fill={d.day === lastDay ? '#67e8f9' : '#52525b'}
               fontFamily="monospace"
               textAnchor="middle"
             >
@@ -339,6 +627,9 @@ function DailyUsageChart({
         </span>
         <span className="flex items-center gap-1.5">
           <span className="w-4 h-0.5 bg-violet-400 inline-block rounded" /> requests
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-sm bg-cyan-400 inline-block" /> today
         </span>
       </div>
     </div>

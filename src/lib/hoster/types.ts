@@ -402,7 +402,31 @@ export interface UsageReport {
     egressMb: number;
     equivalentCostUsd: number;
     paidUsd: number;
-    liveInstanceSeconds: number;
+    liveInstances: number;
+    unflushedRequests: number;
+  };
+  today: {
+    day: string;
+    equivalentUsd: number;
+    hoursElapsed: number;
+    runRateUsdPerDay: number;
+  };
+  projection: {
+    hoursPerMonth: number;
+    globalCurrentUsd: number;
+    globalMaxUsd: number;
+    perService: {
+      serviceId: string;
+      name: string;
+      status: string;
+      tier: string;
+      ratePerHourUsd: number;
+      currentInstances: number;
+      maxInstances: number;
+      autoscaleCapable: boolean;
+      projectedCurrentUsd: number;
+      projectedMaxUsd: number;
+    }[];
   };
   perDay: {
     day: string;
