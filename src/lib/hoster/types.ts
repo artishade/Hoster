@@ -393,6 +393,40 @@ export interface HostHistoryPoint {
   netOutMb?: number | null;
 }
 
+/** REAL usage metering report (GET /api/usage). */
+export interface UsageReport {
+  windowDays: number;
+  global: {
+    instanceHours: number;
+    requests: number;
+    egressMb: number;
+    equivalentCostUsd: number;
+    paidUsd: number;
+    liveInstanceSeconds: number;
+  };
+  perDay: {
+    day: string;
+    instanceHours: number;
+    requests: number;
+    egressMb: number;
+    equivalentCostUsd: number;
+  }[];
+  perService: {
+    serviceId: string;
+    name: string;
+    status: string;
+    tier: string;
+    instanceHours: number;
+    requests: number;
+    egressMb: number;
+    equivalentCostUsd: number;
+    ratePerHourUsd: number;
+    firstSeenDay: string | null;
+    lastSeenDay: string | null;
+  }[];
+  rates: { formula: string; note: string };
+}
+
 export interface ProvisionDatabasePayload {
   kind: 'postgres' | 'redis';
   name: string;

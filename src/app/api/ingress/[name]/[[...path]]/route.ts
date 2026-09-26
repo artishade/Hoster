@@ -3,6 +3,7 @@ import { db } from '@/lib/db';
 import { ensureRuntime } from '@/lib/hoster/runtime';
 import { recordIngressRequest } from '@/lib/hoster/deployer';
 import { pickWorkerPort } from '@/lib/hoster/autoscaler';
+import { bumpUsageCounters } from '@/lib/hoster/usage';
 
 /**
  * Same-origin ingress for deployed services.
@@ -96,8 +97,10 @@ async function handle(req: NextRequest, ctx: Ctx): Promise<Response> {
       );
     }
 
-    // count the REAL proxied request (traffic metrics for git-deployed apps)
-    recordIngressRequest(row.id, { method, path: `/${subPath}` || '/', status: upstream.status, ms: Date.now() - t0 });
+    // count the REAL proxied request (traffic metrics + usage metering)
+    const bytesOut = Number(upstream.headers.get('content-length')) || undefined;
+    recordIngressRequest(row.id, { method, path: `/${subPath}` || '/', status: upstream.status, ms: Date.now() - t0, bytesOut });
+    bumpUsageCounters(row.id, bytesOut);
 
     const resHeaders = new Headers();
     upstream.headers.forEach((value, key) => {

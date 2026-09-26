@@ -6,6 +6,7 @@ import { getHostMetrics } from './metrics';
 import { computeServiceMetrics, computePostgresUsage, computeRedisUsage, hostTotalRamGb } from './telemetry';
 import { ensureRuntime, getLiveStateSnapshot } from './runtime';
 import { deployProcessStats, getDeployHandle } from './deployer';
+import { flushServiceUsage } from './usage';
 import { HARDWARE_SPECS, DYNAMIC_FREE_TIERS } from './hardware-specs';
 import type {
   Service,
@@ -425,6 +426,12 @@ export async function recordHostSample(): Promise<void> {
           extraJson: JSON.stringify({ requestsPerMin: rpm, latencyP95Ms: percentileOf(live.latencies, 95) }),
         },
       });
+      // ── usage metering: bank 15s × live instances + ingress deltas ──
+      try {
+        await flushServiceUsage(svc.id, SAMPLE_INTERVAL_MS / 1000, svc.runtimeJson);
+      } catch {
+        /* usage metering must never break the sampler */
+      }
     }
     // trim service samples
     const svcCount = await db.metricSample.count({ where: { scope: 'service' } });

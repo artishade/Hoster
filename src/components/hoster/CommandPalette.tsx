@@ -29,6 +29,7 @@ import {
   Sparkles,
   CornerDownLeft,
   ArrowRight,
+  Receipt,
 } from 'lucide-react';
 import type { Service } from '@/lib/hoster/types';
 
@@ -59,6 +60,7 @@ const VIEWS = [
   { id: 'domains', label: 'Custom Domains', hint: 'DNS verification, vhosts', icon: Globe },
   { id: 'edge', label: 'Edge Network PoP', hint: 'routing table, upstreams', icon: Activity },
   { id: 'activity', label: 'Activity & Events', hint: 'live platform event stream', icon: Activity },
+  { id: 'usage', label: 'Usage & Spend Meter', hint: 'instance-hours, requests, cost', icon: Receipt },
   { id: 'providers', label: 'Nodes & Free Providers', hint: 'live pool, capacity', icon: Layers },
   { id: 'mcp-inspector', label: 'MCP & Plugin Studio', hint: 'JSON-RPC inspector', icon: Sparkles },
   { id: 'settings', label: 'Dashboard Settings', hint: 'platform config', icon: Settings },

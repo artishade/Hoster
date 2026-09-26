@@ -212,8 +212,8 @@ export default function ServiceHistoryChart({ serviceId, ramTotalGb }: Props) {
         {/* Y-axis labels */}
         {points.length >= 2 && (
           <>
-            <span className="absolute left-1.5 top-1 text-[9px] font-mono text-zinc-600">100%</span>
-            <span className="absolute left-1.5 bottom-1 text-[9px] font-mono text-zinc-600">0%</span>
+            <span className="absolute left-3 top-0.5 text-[9px] font-mono text-zinc-600 bg-zinc-950/70 rounded px-0.5">100%</span>
+            <span className="absolute left-3 bottom-0.5 text-[9px] font-mono text-zinc-600 bg-zinc-950/70 rounded px-0.5">0%</span>
           </>
         )}
       </div>

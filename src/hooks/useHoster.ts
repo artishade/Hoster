@@ -15,6 +15,7 @@ import type {
   CustomServerNode,
   ProviderActionResult,
   NewProviderPayload,
+  UsageReport,
 } from '@/lib/hoster/types';
 import type { DeployPayload as ModalDeployPayload } from '@/components/hoster/DeployModal';
 
@@ -132,6 +133,16 @@ export function useHostHistory(points = 80) {
     queryKey: ['system', 'history', points],
     queryFn: () => api<HostHistoryPoint[]>(`/api/system/history?points=${points}`),
     refetchInterval: 15000,
+    ...QUERY_OPTS,
+  });
+}
+
+/** REAL usage metering report (instance-hours, requests, egress + equivalent cost). */
+export function useUsage(days = 30) {
+  return useQuery({
+    queryKey: ['usage', days],
+    queryFn: () => api<UsageReport>(`/api/usage?days=${days}`),
+    refetchInterval: 20000,
     ...QUERY_OPTS,
   });
 }

@@ -87,6 +87,7 @@ const sourceLabels: Record<string, string> = {
   'nexus-platform': 'platform',
   'service-runner': 'service-runner',
   'terminal-service': 'terminal',
+  exec: 'exec',
   'webhook-receiver': 'webhook',
 };
 
@@ -345,7 +346,10 @@ export default function ActivityFeedView() {
                       {l.level}
                     </span>
                     <span className="text-[10px] font-mono text-zinc-600">{sourceLabels[l.source ?? ''] ?? l.source ?? 'platform'}</span>
-                    <span className="text-[10px] font-mono text-zinc-500 ml-auto" title={exactTime(l.timestamp)}>
+                    <span
+                      className="text-[10px] font-mono text-zinc-500 ml-auto shrink-0 pl-2 border-l border-zinc-800/60 whitespace-nowrap"
+                      title={exactTime(l.timestamp)}
+                    >
                       {relTime(l.timestamp)}
                     </span>
                   </div>

@@ -200,6 +200,25 @@ model WebhookDelivery {
   @@index([serviceId, createdAt])
 }
 
+// ─── Usage metering (REAL instance-hours / requests / egress per day) ────────
+// Accumulated by the host sampler (15s ticks) + ingress counters. The
+// "equivalent cloud cost" in the UI multiplies these real quantities by
+// public list prices — the platform itself bills $0.00 (free tier).
+
+model UsageDaily {
+  id              Int      @id @default(autoincrement())
+  serviceId       String
+  day             String   // YYYY-MM-DD (UTC)
+  instanceSeconds Float    @default(0) // real uptime × live instance count
+  requests        Int      @default(0) // real proxied requests
+  egressMb        Float    @default(0) // real response bytes when measurable
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([serviceId, day])
+  @@index([day])
+}
+
 // ─── Metrics history (host + services) ───────────────────────────────────────
 
 model MetricSample {

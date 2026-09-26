@@ -47,6 +47,7 @@ import { Server,
 } from 'lucide-react';
 import ServiceTerminal from './ServiceTerminal';
 import ServiceHistoryChart from './ServiceHistoryChart';
+import QuickExecPanel from './QuickExecPanel';
 
 /** On-disk app.log metadata + tail lines (complete stdout+stderr record). */
 interface LogFileData {
@@ -977,7 +978,7 @@ export default function ServiceDetailView({
         </div>
       )}
 
-      {/* TAB 2.5: WORKSPACE SHELL — real PTY terminal into the deployment workspace */}
+      {/* TAB 2.5: WORKSPACE SHELL — real PTY terminal + one-shot exec into the deployment workspace */}
       {activeTab === 'terminal' && (
         <div className="space-y-4">
           <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -995,6 +996,7 @@ export default function ServiceDetailView({
               </p>
             </div>
           </div>
+          <QuickExecPanel service={service} />
           <ServiceTerminal service={service} />
         </div>
       )}

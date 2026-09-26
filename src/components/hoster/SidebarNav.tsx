@@ -14,6 +14,7 @@ import {
   Settings,
   Network,
   Radio,
+  Receipt,
 } from 'lucide-react';
 
 export interface SidebarNavProps {
@@ -109,8 +110,15 @@ export default function SidebarNav({
       badgeKind: 'live' as const,
     },
     {
+      id: 'usage',
+      label: 'Usage & Spend Meter',
+      icon: Receipt,
+      badge: '$0',
+      badgeKind: 'text' as const,
+    },
+    {
       id: 'mcp-inspector',
-      label: 'MCP & Plugin Studio',
+      label: 'MCP & Plugins',
       icon: Terminal,
       badge: 'JSON-RPC',
       badgeKind: 'text' as const,
