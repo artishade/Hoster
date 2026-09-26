@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -55,3 +56,18 @@ server.log
 # real deploy workspaces + volume backing dirs
 deployments/
 volumes-data/
+
+# local SQLite database (contains real provider tokens + webhook secrets)
+db/*.db
+db/*.db-shm
+db/*.db-wal
+db/*.sqlite*
+
+# local tooling artifacts (QA screenshots, tool output)
+tool-results/
+
+# runtime state
+*.pid
+.zscripts/dev.pid
+service.log
+mini-services/terminal-service/service.log
