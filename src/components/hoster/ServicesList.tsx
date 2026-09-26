@@ -291,12 +291,19 @@ export default function ServicesList({
                     </div>
                   </div>
 
-                  {/* Live Metrics Snapshot */}
+                  {/* Live Metrics Snapshot — stopped/failed services have no
+                      live process, so metrics read N/A instead of fake zeros */}
                   <div className="flex items-center gap-3 bg-zinc-950/70 px-4 py-2.5 rounded-lg border border-zinc-800 text-xs font-mono">
                     <div>
                       <div className="text-[10px] text-zinc-500 uppercase">CPU / RAM</div>
                       <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
-                        {srv.metrics.cpuPercent}% <span className="text-zinc-600">&bull;</span> {srv.metrics.ramUsedGb}GB
+                        {srv.status === 'running' || srv.status === 'deploying' || srv.status === 'building' ? (
+                          <>{srv.metrics.cpuPercent}% <span className="text-zinc-600">&bull;</span> {srv.metrics.ramUsedGb}GB</>
+                        ) : (
+                          <span className="text-zinc-600" title="No live process — metrics resume when the service runs">
+                            n/a — no process
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -316,7 +323,13 @@ export default function ServicesList({
                     <div className="border-l border-zinc-800 pl-3">
                       <div className="text-[10px] text-zinc-500 uppercase">Traffic &bull; P95</div>
                       <div className="nx-metric-value text-zinc-100 font-semibold text-[13px] mt-0.5">
-                        {srv.metrics.requestsPerMin} <span className="text-zinc-500">rpm</span> <span className="text-zinc-600">&bull;</span> {srv.metrics.latencyP95Ms}ms
+                        {srv.status === 'running' || srv.status === 'deploying' || srv.status === 'building' ? (
+                          <>{srv.metrics.requestsPerMin} <span className="text-zinc-500">rpm</span> <span className="text-zinc-600">&bull;</span> {srv.metrics.latencyP95Ms}ms</>
+                        ) : (
+                          <span className="text-zinc-600" title="Ingress counters resume with the process">
+                            n/a — no process
+                          </span>
+                        )}
                       </div>
                     </div>
 

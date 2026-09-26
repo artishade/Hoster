@@ -40,8 +40,11 @@ import { Server,
   Webhook,
   RotateCw,
   FileText,
-  History
+  History,
+  SquareArrowRight
 } from 'lucide-react';
+import ServiceTerminal from './ServiceTerminal';
+import ServiceHistoryChart from './ServiceHistoryChart';
 
 /** On-disk app.log metadata + tail lines (complete stdout+stderr record). */
 interface LogFileData {
@@ -100,7 +103,7 @@ export default function ServiceDetailView({
   onRestartService,
   onDeleteService,
 }: ServiceDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'terminal' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage'>('overview');
   
   // Hardware Spec
   const spec = HARDWARE_SPECS[service.hardwareTier] || HARDWARE_SPECS['cpu-standard'];
@@ -544,6 +547,7 @@ export default function ServiceDetailView({
         {[
           { id: 'overview', label: 'Metrics & Health', icon: Activity },
           { id: 'logs', label: 'Live Logs Terminal', icon: Terminal },
+          { id: 'terminal', label: 'Workspace Shell (PTY)', icon: SquareArrowRight },
           { id: 'webhooks', label: 'Deploy Webhooks', icon: Webhook },
           ...(isMcp || isPlugin ? [{ id: 'mcp', label: 'MCP & Plugin Studio', icon: Code }] : []),
           { id: 'hardware', label: 'Hardware & GPU Scaling', icon: Cpu },
@@ -556,7 +560,7 @@ export default function ServiceDetailView({
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
+              onClick={() => setActiveTab(tab.id as 'overview' | 'logs' | 'terminal' | 'webhooks' | 'mcp' | 'hardware' | 'env' | 'domains' | 'storage')}
               className={`flex items-center gap-2 px-4 py-2.5 border-b-2 whitespace-nowrap transition ${
                 isActive
                   ? 'border-cyan-400 text-cyan-300 bg-cyan-950/20'
@@ -605,9 +609,16 @@ export default function ServiceDetailView({
                 />
               </div>
               <p className="text-[10px] text-zinc-500 font-mono mt-1.5">
-                {Math.round((service.metrics.ramUsedGb / service.metrics.ramTotalGb) * 100)}% utilized
-                {service.runtime?.mode === 'builtin-runner' && (
-                  <span className="text-zinc-600"> · measured RSS share of the shared control-plane process</span>
+                {service.runtime?.mode === 'builtin-runner' ? (
+                  <>
+                    in-process runner — the {service.metrics.ramUsedGb} GB shown is the shared control-plane RSS
+                    (this runner has no separate address space; host chart is authoritative)
+                  </>
+                ) : (
+                  <>
+                    {Math.round((service.metrics.ramUsedGb / service.metrics.ramTotalGb) * 100)}% utilized
+                    {service.runtime?.mode === 'git-deploy' && ' · measured RSS of the real worker process'}
+                  </>
                 )}
               </p>
             </div>
@@ -658,74 +669,8 @@ export default function ServiceDetailView({
             </div>
           </div>
 
-          {/* Graphical Traffic & Compute SVG Chart */}
-          <div className="p-5 rounded-2xl bg-zinc-900/50 border border-zinc-800 space-y-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-xs font-bold text-zinc-200">
-                  Live Resource Load &amp; Ingress (Last 30 Minutes)
-                </h3>
-                <p className="text-[11px] text-zinc-400">
-                  Telemetry sampled every 10s via internal eBPF edge probes
-                </p>
-              </div>
-              <div className="flex items-center gap-3 text-[11px] font-mono">
-                <span className="flex items-center gap-1.5 text-cyan-400">
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400" />
-                  Traffic (rpm)
-                </span>
-                <span className="flex items-center gap-1.5 text-emerald-400">
-                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
-                  {isGpu ? 'GPU Compute %' : 'CPU %'}
-                </span>
-              </div>
-            </div>
-
-            {/* Simulated Live SVG Line Graph */}
-            <div className="relative h-44 w-full bg-zinc-950/80 rounded-xl border border-zinc-800/80 p-3 overflow-hidden">
-              <svg className="w-full h-full" viewBox="0 0 600 120" preserveAspectRatio="none">
-                <defs>
-                  <linearGradient id="cyanGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.3" />
-                    <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.0" />
-                  </linearGradient>
-                  <linearGradient id="emeraldGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#10b981" stopOpacity="0.3" />
-                    <stop offset="100%" stopColor="#10b981" stopOpacity="0.0" />
-                  </linearGradient>
-                </defs>
-
-                {/* Horizontal Grid lines */}
-                <line x1="0" y1="30" x2="600" y2="30" stroke="#27272a" strokeDasharray="3 3" />
-                <line x1="0" y1="60" x2="600" y2="60" stroke="#27272a" strokeDasharray="3 3" />
-                <line x1="0" y1="90" x2="600" y2="90" stroke="#27272a" strokeDasharray="3 3" />
-
-                {/* Traffic Path Area */}
-                <path
-                  d="M0,80 Q50,45 100,55 T200,40 T300,70 T400,30 T500,45 T600,35 L600,120 L0,120 Z"
-                  fill="url(#cyanGrad)"
-                />
-                <path
-                  d="M0,80 Q50,45 100,55 T200,40 T300,70 T400,30 T500,45 T600,35"
-                  fill="none"
-                  stroke="#06b6d4"
-                  strokeWidth="2"
-                />
-
-                {/* GPU Compute Path Area */}
-                <path
-                  d="M0,95 Q50,75 100,60 T200,65 T300,50 T400,55 T500,35 T600,40 L600,120 L0,120 Z"
-                  fill="url(#emeraldGrad)"
-                />
-                <path
-                  d="M0,95 Q50,75 100,60 T200,65 T300,50 T400,55 T500,35 T600,40"
-                  fill="none"
-                  stroke="#10b981"
-                  strokeWidth="2"
-                />
-              </svg>
-            </div>
-          </div>
+          {/* REAL per-service metric history (replaces the old simulated SVG) */}
+          <ServiceHistoryChart serviceId={service.id} ramTotalGb={service.metrics.ramTotalGb || spec.ramGb} />
         </div>
       )}
 
@@ -970,7 +915,29 @@ export default function ServiceDetailView({
         </div>
       )}
 
-      {/* TAB 2.5: DEPLOY WEBHOOKS (REAL push-to-deploy) */}
+      {/* TAB 2.5: WORKSPACE SHELL — real PTY terminal into the deployment workspace */}
+      {activeTab === 'terminal' && (
+        <div className="space-y-4">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div>
+              <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                <SquareArrowRight className="w-4 h-4 text-cyan-400" />
+                Workspace Shell
+              </h3>
+              <p className="text-xs text-zinc-400 mt-1">
+                A real bash pseudo-terminal spawned inside{' '}
+                <code className="text-cyan-300/90 bg-cyan-950/30 px-1 py-0.5 rounded text-[10px]">
+                  deployments/{service.name}/repo
+                </code>{' '}
+                — inspect files, read git state, probe the running app, debug the build, exactly like SSH.
+              </p>
+            </div>
+          </div>
+          <ServiceTerminal service={service} />
+        </div>
+      )}
+
+      {/* TAB 2.75: DEPLOY WEBHOOKS (REAL push-to-deploy) */}
       {activeTab === 'webhooks' && (
         <div className="space-y-6">
           {!service.repoUrl && (

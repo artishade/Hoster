@@ -368,7 +368,7 @@ export default function HomePage() {
   } as const;
 
   return (
-    <div className="min-h-screen bg-[#090a0f] text-zinc-100 flex flex-col font-sans selection:bg-cyan-500/30 selection:text-cyan-200">
+    <div className="h-dvh min-h-[560px] bg-[#090a0f] text-zinc-100 flex flex-col font-sans selection:bg-cyan-500/30 selection:text-cyan-200 overflow-hidden">
       {/* Top Global Navigation Bar */}
       <Navbar
         onNewDeploy={() => setIsDeployModalOpen(true)}
@@ -379,8 +379,9 @@ export default function HomePage() {
         connectionState={connectionState}
       />
 
-      {/* Main Container Layout */}
-      <div className="flex-1 flex overflow-hidden">
+      {/* Main Container Layout — height-bounded app shell: main scrolls internally,
+          sidebar never scrolls behind the sticky header (QA fix) */}
+      <div className="flex-1 min-h-0 flex overflow-hidden">
         {/* Sidebar Navigation (desktop) + Mobile Side Panel (< md) */}
         <Sidebar {...sidebarNavProps} />
         <MobileSidePanel
@@ -390,7 +391,7 @@ export default function HomePage() {
         />
 
         {/* Dynamic Content Area */}
-        <main className="flex-1 overflow-y-auto px-4 lg:px-8 py-6 min-w-0">
+        <main className="flex-1 min-w-0 overflow-y-auto custom-scrollbar px-4 lg:px-8 py-6">
           <div className="max-w-7xl mx-auto space-y-6">
             {/* Initial load — skeleton instead of a stuck text line */}
             {loading && (

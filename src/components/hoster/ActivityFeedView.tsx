@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Radio,
   Pause,
@@ -18,9 +18,25 @@ import {
   Search,
   ChevronDown,
   Activity,
+  Webhook,
 } from 'lucide-react';
 import { useLogs } from '@/hooks/useHoster';
 import type { LogEntry } from '@/lib/hoster/types';
+
+/** One REAL webhook delivery row (GitHub push / generic CI trigger). */
+interface DeliveryRow {
+  id: string;
+  serviceId: string | null;
+  serviceName: string | null;
+  event: string;
+  repo: string;
+  branch: string;
+  sender: string;
+  commitSha: string;
+  result: string;
+  detail: string;
+  createdAt: string;
+}
 
 /**
  * Global Activity & Events feed — a LIVE stream of everything the platform
@@ -31,6 +47,7 @@ import type { LogEntry } from '@/lib/hoster/types';
 
 const SCOPES = [
   { id: 'deploy', label: 'Deployments', icon: Rocket, color: 'text-cyan-400', dot: 'bg-cyan-400' },
+  { id: 'webhooks', label: 'Webhooks', icon: Webhook, color: 'text-fuchsia-400', dot: 'bg-fuchsia-400' },
   { id: 'provider', label: 'Providers', icon: Layers, color: 'text-violet-400', dot: 'bg-violet-400' },
   { id: 'service', label: 'Services', icon: Server, color: 'text-emerald-400', dot: 'bg-emerald-400' },
   { id: 'database', label: 'Databases', icon: Database, color: 'text-rose-400', dot: 'bg-rose-400' },
@@ -69,6 +86,8 @@ const sourceLabels: Record<string, string> = {
   settings: 'settings',
   'nexus-platform': 'platform',
   'service-runner': 'service-runner',
+  'terminal-service': 'terminal',
+  'webhook-receiver': 'webhook',
 };
 
 export default function ActivityFeedView() {
@@ -81,19 +100,60 @@ export default function ActivityFeedView() {
   const logsQ = useLogs({ limit: 150, refetchMs: paused ? false : 5000 });
   const logs: LogEntry[] = logsQ.data ?? [];
 
+  // REAL webhook deliveries (GitHub push / generic CI) — merged into the
+  // global timeline so pushes that triggered real redeploys are visible here.
+  const [deliveries, setDeliveries] = useState<DeliveryRow[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/webhooks/deliveries?limit=60', { cache: 'no-store' });
+        if (res.ok) {
+          const json = (await res.json()) as { data?: DeliveryRow[] };
+          if (alive) setDeliveries(Array.isArray(json.data) ? json.data : []);
+        }
+      } catch {
+        /* deliveries are best-effort */
+      }
+    };
+    void load();
+    if (paused) return () => { alive = false; };
+    const t = setInterval(() => void load(), 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, [paused]);
+
+  const webhookRows: LogEntry[] = useMemo(
+    () =>
+      deliveries.map((d) => ({
+        id: `wh-${d.id}`,
+        serviceId: d.serviceId ?? null,
+        level: (d.result === 'rejected' ? 'error' : d.result === 'skipped' ? 'warn' : 'info') as LogEntry['level'],
+        message: `push ${d.repo || '(unknown repo)'}@${d.branch || '-'} by ${d.sender || 'unknown'}${d.commitSha ? ` (${d.commitSha.slice(0, 7)})` : ''} → ${d.result.toUpperCase()}${d.detail ? `: ${d.detail}` : ''}`,
+        source: 'webhook-receiver',
+        timestamp: d.createdAt,
+      })),
+    [deliveries]
+  );
+
+  const allRows = useMemo(
+    () => [...logs, ...webhookRows].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
+    [logs, webhookRows]
+  );
+
   const filtered = useMemo(() => {
     // scope lives on the API row; LogEntry type doesn't carry it — derive from source
     const scopeOf = (l: LogEntry): string => {
       const s = l.source ?? 'nexus-platform';
       if (s === 'git-deployer' || s === 'build-runner' || s === 'orchestrator') return 'deploy';
+      if (s === 'webhook-receiver') return 'webhooks';
       if (s === 'watchdog' || s === 'node-agent' || s === 'settings') return 'provider';
-      if (s === 'app' || s === 'service-runner') return 'service';
+      if (s === 'app' || s === 'service-runner' || s === 'terminal-service') return 'service';
       if (s === 'db-provisioner' || s === 'sql-console') return 'database';
       if (s === 'edge-dns') return 'domain';
       if (s === 'volume-provisioner') return 'storage';
       return 'system';
     };
-    let rows = logs;
+    let rows = allRows;
     if (scopeFilter) rows = rows.filter((l) => scopeOf(l) === scopeFilter);
     if (levelFilter !== 'all') rows = rows.filter((l) => l.level === levelFilter);
     if (search.trim()) {
@@ -101,14 +161,14 @@ export default function ActivityFeedView() {
       rows = rows.filter((l) => l.message.toLowerCase().includes(q) || (l.source ?? '').toLowerCase().includes(q));
     }
     return rows;
-  }, [logs, scopeFilter, levelFilter, search]);
+  }, [allRows, scopeFilter, levelFilter, search]);
 
   const recentCount = useMemo(
-    () => logs.filter((l) => Date.now() - new Date(l.timestamp).getTime() < 5 * 60_000).length,
-    [logs]
+    () => allRows.filter((l) => Date.now() - new Date(l.timestamp).getTime() < 5 * 60_000).length,
+    [allRows]
   );
-  const errorCount = useMemo(() => logs.filter((l) => l.level === 'error').length, [logs]);
-  const warnCount = useMemo(() => logs.filter((l) => l.level === 'warn').length, [logs]);
+  const errorCount = useMemo(() => allRows.filter((l) => l.level === 'error').length, [allRows]);
+  const warnCount = useMemo(() => allRows.filter((l) => l.level === 'warn').length, [allRows]);
 
   return (
     <div className="space-y-5">
@@ -140,10 +200,11 @@ export default function ActivityFeedView() {
       </div>
 
       {/* Stat strip */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3">
         {[
-          { label: 'events (buffer)', value: logs.length, accent: 'text-zinc-100' },
+          { label: 'events (buffer)', value: allRows.length, accent: 'text-zinc-100' },
           { label: 'last 5 min', value: recentCount, accent: 'text-cyan-300' },
+          { label: 'webhook pushes', value: webhookRows.length, accent: 'text-fuchsia-300' },
           { label: 'warnings', value: warnCount, accent: 'text-amber-300' },
           { label: 'errors', value: errorCount, accent: 'text-red-400' },
         ].map((s) => (
@@ -247,8 +308,9 @@ export default function ActivityFeedView() {
             const scope = (() => {
               const s = l.source ?? 'nexus-platform';
               if (s === 'git-deployer' || s === 'build-runner' || s === 'orchestrator') return 'deploy';
+              if (s === 'webhook-receiver') return 'webhooks';
               if (s === 'watchdog' || s === 'node-agent' || s === 'settings') return 'provider';
-              if (s === 'app' || s === 'service-runner') return 'service';
+              if (s === 'app' || s === 'service-runner' || s === 'terminal-service') return 'service';
               if (s === 'db-provisioner' || s === 'sql-console') return 'database';
               if (s === 'edge-dns') return 'domain';
               if (s === 'volume-provisioner') return 'storage';

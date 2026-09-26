@@ -248,8 +248,10 @@ async function waitHttpOk(port: number, timeoutMs: number, pathToTry: string): P
         cache: 'no-store',
         redirect: 'manual',
       });
-      // Any HTTP answer (including 4xx/5xx) means the app is REALLY serving.
-      if (res.status < 500 || res.status === 501) return true;
+      // ANY HTTP answer means the app process is up and speaking HTTP —
+      // even 5xx (Heroku-style readiness: binding the port = live; app-level
+      // errors are the app's own, visible in its logs).
+      return true;
     } catch {
       /* not up yet */
     }
@@ -259,6 +261,23 @@ async function waitHttpOk(port: number, timeoutMs: number, pathToTry: string): P
 }
 
 // ─── stack detection ─────────────────────────────────────────────────────────
+
+/** Extract the `web:` process command from a Heroku-style Procfile. */
+async function readProcfileWeb(repoDir: string): Promise<string | null> {
+  try {
+    const text = await fsp.readFile(path.join(repoDir, 'Procfile'), 'utf8');
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.trim();
+      if (/^web:\s+/.test(line)) {
+        const cmd = line.replace(/^web:\s+/, '').trim();
+        if (cmd) return cmd;
+      }
+    }
+  } catch {
+    /* no Procfile */
+  }
+  return null;
+}
 
 interface DetectedStack {
   runtime: 'node' | 'python' | 'static' | 'unknown';
@@ -294,8 +313,31 @@ async function detectStack(repoDir: string, pkg: Record<string, unknown> | null,
     .access(path.join(repoDir, 'main.py'))
     .then(() => true)
     .catch(() => false);
-  if (hasPy && (hasAppPy || hasMainPy)) {
-    return { runtime: 'python', startCommand: `python3 ${hasAppPy ? 'app.py' : 'main.py'}`, buildCommand: null, reason: 'Python project (requirements.txt)' };
+  const hasManagePy = await fsp
+    .access(path.join(repoDir, 'manage.py'))
+    .then(() => true)
+    .catch(() => false);
+  if (hasPy) {
+    // requirements.txt present → python runtime, with a sensible entry:
+    // app.py / main.py → direct, Procfile web: → heroku-style (gunicorn/uvicorn,
+    // resolves inside the service venv via PATH), manage.py → django runserver.
+    let start = 'python3 -m http.server $PORT --bind 127.0.0.1'; // harmless static fallback
+    let reason = 'Python project (requirements.txt)';
+    if (hasAppPy) {
+      start = 'python3 app.py';
+    } else if (hasMainPy) {
+      start = 'python3 main.py';
+    } else {
+      const procfileCmd = await readProcfileWeb(repoDir);
+      if (procfileCmd) {
+        start = procfileCmd;
+        reason = `Python project (requirements.txt + Procfile web: ${procfileCmd.slice(0, 60)})`;
+      } else if (hasManagePy) {
+        start = 'python3 manage.py runserver 0.0.0.0:$PORT --noreload';
+        reason = 'Python project (requirements.txt + manage.py → django dev server)';
+      }
+    }
+    return { runtime: 'python', startCommand: start, buildCommand: null, reason };
   }
   if (hasIndexHtml) {
     return { runtime: 'static', startCommand: '__static__', buildCommand: null, reason: 'static index.html at repo root' };
@@ -429,7 +471,7 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
     const detected = await detectStack(repoDir, pkg, hasIndexHtml);
 
     const buildCmd = svc.buildCommand || detected.buildCommand || '';
-    const startCmd = svc.startCommand || detected.startCommand || '';
+    let startCmd = svc.startCommand || detected.startCommand || '';
     await dlog(svc.id, `Stack detected: ${detected.reason} → runtime=${detected.runtime}${buildCmd ? `, build="${buildCmd}"` : ''}, start="${startCmd || '(static server)'}"`);
 
     if (detected.runtime === 'unknown' && !startCmd) {
@@ -438,7 +480,8 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       return;
     }
 
-    // ── 4. install dependencies (node) ───────────────────────────────────
+    // ── 4. install dependencies (node) ─────────────────────────────────────
+    let venvBinDir: string | null = null; // set when a python venv exists → child PATH
     if (detected.runtime === 'node') {
       await dlog(svc.id, 'Installing dependencies with bun install...');
       const install = await run('bun', ['install'], {
@@ -462,14 +505,69 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       }
       await dlog(svc.id, 'Dependencies installed.');
     } else if (detected.runtime === 'python') {
-      await dlog(svc.id, 'Installing python dependencies with pip (user site)...');
-      const pip = await run('python3', ['-m', 'pip', 'install', '--user', '-r', 'requirements.txt'], {
-        cwd: repoDir,
-        timeoutMs: INSTALL_TIMEOUT_MS,
-        onLine: (line) => void dlog(svc.id, `[pip] ${line}`),
-      });
-      if (pip.code !== 0) {
-        await dlog(svc.id, `pip install FAILED: ${tailText(pip.stderr, 600)} — continuing, app may still boot`, 'warn');
+      // ── Venv isolation: each python service gets its own .venv inside its
+      // workspace — dependencies never leak between services or into the
+      // user's --user site-packages (heavy ML repos stop colliding).
+      const venvPython = path.join(repoDir, '.venv', 'bin', 'python');
+      let venvOk = fs.existsSync(venvPython);
+      if (!venvOk) {
+        await dlog(svc.id, 'Creating isolated python virtualenv (.venv) in the workspace...');
+        const venv = await run('python3', ['-m', 'venv', '--clear', '.venv'], {
+          cwd: repoDir,
+          timeoutMs: 180_000,
+          onLine: (line) => void dlog(svc.id, `[venv] ${line}`),
+        });
+        venvOk = venv.code === 0 && fs.existsSync(venvPython);
+        if (!venvOk) {
+          await dlog(svc.id, `venv creation failed: ${tailText(venv.stderr, 400)} — falling back to --user pip install`, 'warn');
+        }
+      }
+      if (venvOk) {
+        await dlog(svc.id, 'Installing python dependencies into the isolated venv (pip)...');
+        const pip = await run(venvPython, ['-m', 'pip', 'install', '--no-input', '-r', 'requirements.txt'], {
+          cwd: repoDir,
+          timeoutMs: INSTALL_TIMEOUT_MS,
+          onLine: (line) => void dlog(svc.id, `[pip] ${line}`),
+        });
+        if (pip.code !== 0) {
+          await dlog(svc.id, `pip install FAILED: ${tailText(pip.stderr, 600)} — continuing, app may still boot`, 'warn');
+        }
+        // Pin the start command to the venv interpreter (both auto-detected
+        // and user-supplied python3/python invocations).
+        startCmd = startCmd.replace(
+          /(^|[\s"'=;&|])python3?(?=\s|$)/g,
+          (_m, sep: string) => `${sep}${venvPython}`,
+        );
+        await dlog(svc.id, `Python start command pinned to venv interpreter: ${startCmd}`);
+        venvBinDir = path.join(repoDir, '.venv', 'bin');
+        // django/whitenoise: collect static files (the Heroku buildpack step) —
+        // gunicorn 500s with "Missing staticfiles manifest entry" without it.
+        if (fs.existsSync(path.join(repoDir, 'manage.py'))) {
+          await dlog(svc.id, 'Running collectstatic (django static manifest, venv python)...');
+          const cs = await run('bash', ['-lc', `PATH="${venvBinDir}:$PATH" python manage.py collectstatic --noinput`], {
+            cwd: repoDir,
+            timeoutMs: 180_000,
+            onLine: (line) => void dlog(svc.id, `[collectstatic] ${line}`),
+          });
+          if (cs.code !== 0) {
+            await dlog(svc.id, `collectstatic failed: ${tailText(cs.stderr, 300)} — continuing, static assets may 404`, 'warn');
+          }
+        }
+        // `bash -lc` is a LOGIN shell: profile files reset PATH, so the env
+        // PATH prepend never survives. Wrap the command explicitly so
+        // Procfile-style binaries (gunicorn / uvicorn / flask) resolve inside
+        // the venv no matter what the login profile does to PATH.
+        startCmd = `PATH="${venvBinDir}:$PATH" ${startCmd}`;
+      } else {
+        await dlog(svc.id, 'Installing python dependencies with pip (user site)...');
+        const pip = await run('python3', ['-m', 'pip', 'install', '--user', '-r', 'requirements.txt'], {
+          cwd: repoDir,
+          timeoutMs: INSTALL_TIMEOUT_MS,
+          onLine: (line) => void dlog(svc.id, `[pip] ${line}`),
+        });
+        if (pip.code !== 0) {
+          await dlog(svc.id, `pip install FAILED: ${tailText(pip.stderr, 600)} — continuing, app may still boot`, 'warn');
+        }
       }
     }
 
@@ -505,6 +603,8 @@ export async function startDeployment(svc: DeployableService): Promise<void> {
       HOST: '127.0.0.1',
       NODE_ENV: 'production',
       BUN_ENV: 'production',
+      // python venv binaries first (gunicorn / uvicorn / flask resolve inside the venv)
+      ...(venvBinDir ? { PATH: `${venvBinDir}:${process.env.PATH ?? ''}`, VIRTUAL_ENV: path.join(venvBinDir, '..') } : {}),
     };
     for (const v of envVars) childEnv[v.key] = v.value;
     // REAL volume mounts → the app gets a bind path env var + a symlinked dir

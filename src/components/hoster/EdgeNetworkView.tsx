@@ -210,7 +210,7 @@ export default function EdgeNetworkView() {
             </div>
             <div className="p-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
               {[
-                ['PoP ID', info.pop.id],
+                ['PoP ID', info.pop.id.length > 26 ? `${info.pop.id.slice(0, 14)}…${info.pop.id.slice(-4)}` : info.pop.id],
                 ['Region', info.pop.region],
                 ['Timezone', info.pop.timezone],
                 ['Uptime', fmtUptime(info.pop.uptimeSeconds)],
@@ -221,7 +221,12 @@ export default function EdgeNetworkView() {
               ].map(([label, value]) => (
                 <div key={label} className="min-w-0">
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono">{label}</div>
-                  <div className="text-xs font-mono text-zinc-200 mt-1 truncate" title={String(value)}>{value}</div>
+                  <div
+                    className="text-xs font-mono text-zinc-200 mt-1 truncate cursor-help"
+                    title={label === 'PoP ID' ? info.pop.id : String(value)}
+                  >
+                    {label === 'PoP ID' ? <span className="text-cyan-300/90">{value}</span> : value}
+                  </div>
                 </div>
               ))}
             </div>
